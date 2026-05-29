@@ -106,10 +106,11 @@ WHERE drt.dataset_release_transfer_id = $1
 
 ### 1. Extend `transfer_status` vocabulary
 
-The existing `transfer_status` values on `dataset_release_transfer` are `'draft'`, `'queued'`, `'submitted'`, `'failed'`. We need two more:
+The existing `transfer_status` values on `dataset_release_transfer` are `'draft'`, `'queued'`, `'submitted'`, `'failed'`. We need one more:
 
 - `'in_progress'` — daemon has started uploading files
-- `'completed'` — all files uploaded, manifest written (maps to what the rest of the system may call `'submitted'` — confirm with Posda team which term to use)
+
+The terminal success state remains `'submitted'`. The schema column comment already lists `'submitted'` as the valid completion value, and reusing it avoids vocabulary drift between this daemon and the rest of the Posda system.
 
 ### 2. New table: `transfer_idc_file`
 
@@ -127,10 +128,11 @@ CREATE TABLE public.transfer_idc_file (
     size_bytes                  integer NOT NULL,  -- snapshot of file.size
     gcs_url                     text,              -- populated on success
     status                      text    NOT NULL DEFAULT 'pending',
-        -- 'pending' | 'uploading' | 'completed' | 'failed'
+        -- 'pending' | 'completed' | 'failed'
     error                       text,              -- last error message
     attempts                    integer NOT NULL DEFAULT 0,
-    updated_at                  timestamptz NOT NULL DEFAULT now()
+    updated_at                  timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (dataset_release_transfer_id, file_id)  -- required for the fan-out's ON CONFLICT
 );
 
 CREATE INDEX ON public.transfer_idc_file(dataset_release_transfer_id, status);
@@ -168,31 +170,41 @@ A single **asyncio-based daemon**. GCS uploads are pure I/O, so async with a pro
 
 ```
 Daemon startup
-  └─ Recover stale state from prior crash
-       └─ Reset 'uploading' transfer_idc_file rows back to 'pending'
-       └─ Re-queue any dataset_release_transfer with status 'in_progress'
+  └─ Recovery: find every dataset_release_transfer with transfer_status in ('queued', 'in_progress')
+       └─ Enqueue each for processing — the claim step below handles ownership safely
 
-Event loop (LISTEN/NOTIFY on 'idc_transfer_channel' + startup poll)
-  └─ Pick up dataset_release_transfer WHERE transfer_status = 'queued'
-       └─ Mark transfer 'in_progress'
-       └─ Fan out: INSERT transfer_idc_file via single INSERT ... SELECT (see below)
+Event loop (LISTEN/NOTIFY on 'idc_transfer_channel' + startup recovery)
+  └─ For each transfer_id, process serially under a semaphore (TRANSFER_PARALLELISM = 1)
+       └─ Claim (single transaction):
+            ├─ UPDATE dataset_release_transfer SET transfer_status='in_progress'
+            │    WHERE id=$1 AND transfer_status IN ('queued','in_progress')
+            │    RETURNING id        -- bail out if no row returned (not claimable)
+            ├─ Fan out: INSERT transfer_idc_file via INSERT … SELECT
+            │    (ON CONFLICT DO NOTHING — idempotent on resume)
+            └─ Reset any previously-failed files: UPDATE transfer_idc_file
+                 SET status='pending', attempts=0, error=NULL WHERE status='failed'
+                 (so re-queuing a failed transfer retries them)
        └─ Producer: stream transfer_idc_file rows via cursor (1000 rows/page, status='pending')
        └─ Consumers (N workers) pull from queue and upload
-            ├─ Idempotency: GCS object exists + MD5 matches → mark completed, skip upload
-            ├─ On success: buffer (id, 'completed', gcs_url, None, attempts)
-            └─ On failure: buffer (id, 'failed'/'pending', None, error, attempts+1)
-       └─ Flush buffer to DB in batches of 500 via UPDATE ... WHERE id = ANY(...)
+            ├─ Idempotency: GCS object exists + MD5 matches → record completed, skip upload
+            ├─ On success: push (id, 'completed', gs://…, None, attempts) to results queue
+            └─ On failure: push (id, 'failed'/'pending', None, error, attempts+1)
+       └─ Flusher coroutine drains the results queue and writes UPDATEs in batches
+            (FLUSH_EVERY=500 rows or FLUSH_AFTER=2s, whichever first)
 
 After all files settle (completed or failed)
-  └─ If any failed:    UPDATE dataset_release_transfer SET transfer_status = 'failed'
+  └─ If any failed:    UPDATE dataset_release_transfer SET transfer_status='failed'
   └─ If all succeeded:
-       ├─ Generate manifest (CSV/JSON of file_id → gcs_url)
-       ├─ Upload manifest to GCS
-       ├─ UPDATE transfer_idc SET gcs_url = manifest_url
-       └─ UPDATE dataset_release_transfer SET transfer_status = 'completed' (or 'submitted')
+       ├─ Generate manifest CSV (file_id, gcs_url) from transfer_idc_file
+       ├─ Upload manifest to gs://{BUCKET}/transfers/{transfer_id}/manifest.csv
+       └─ In one transaction:
+            ├─ UPDATE transfer_idc SET gcs_url = manifest_url
+            └─ UPDATE dataset_release_transfer SET transfer_status = 'submitted'
 ```
 
 ### Fan-out SQL (single statement, no Python loop)
+
+Runs inside the claim transaction (see [Atomic claim](#key-design-decisions)):
 
 ```sql
 INSERT INTO public.transfer_idc_file
@@ -207,24 +219,43 @@ FROM transfer_recordset      tr
 JOIN recordset_release_file  rrf ON rrf.recordset_release_id = tr.recordset_release_id
 JOIN file                    f   ON f.file_id                = rrf.file_id
 WHERE tr.dataset_release_transfer_id = $1
-ON CONFLICT DO NOTHING;  -- idempotent: safe to re-run if daemon crashes mid fan-out
+ON CONFLICT (dataset_release_transfer_id, file_id) DO NOTHING;  -- idempotent on resume
 ```
 
 ### Key Design Decisions
 
-**Producer/consumer with streaming cursor** — don't load all 500k rows into memory at once. A cursor fetches pages of 1000 rows into an `asyncio.Queue`. Workers pull from the queue, providing natural backpressure.
+**Atomic claim** — the transition `queued → in_progress` is a conditional `UPDATE … WHERE transfer_status IN ('queued','in_progress') RETURNING id` issued *inside the same transaction* as the fan-out INSERT and the failed-file reset. If no row is returned, this daemon doesn't own the transfer (another instance got it, or it's already past `in_progress`) and the worker bails out. This makes the daemon safe under restarts and brief deploy-time overlaps.
 
-**Batched DB writes for completions** — at 500k files, one `UPDATE` per completion adds 8+ minutes of pure DB overhead. Workers accumulate results and flush with a single `UPDATE ... WHERE id = ANY($1)` every 500 completions or every few seconds, whichever comes first.
+**Single-transfer serialization** — `TRANSFER_PARALLELISM=1`. With ~256GB per transfer and a ~1000 writes/sec GCS budget, running two transfers concurrently just halves throughput for each while doubling the failure surface. A semaphore in front of `process_transfer` enforces this; raise it later if a real reason emerges.
 
-**LISTEN/NOTIFY over polling** — the trigger fires on INSERT or re-queue. The daemon wakes instantly. On startup it polls once to catch anything missed while it was down.
+**Producer / consumer / flusher** — three coroutine roles per transfer:
 
-**Idempotent file uploads** — before uploading, check if the GCS object already exists and its MD5 matches the stored digest. If so, mark completed without re-uploading. Safe to restart at any point.
+- *Producer* streams `status='pending'` rows from a server-side cursor (`prefetch=1000`) into a bounded `asyncio.Queue`. No 500k-row memory blow-up; the bounded queue provides backpressure.
+- *Consumers* (`CONCURRENCY=200`) pull rows, do the GCS work, and push result tuples to a separate results queue. They never touch the DB directly.
+- *Flusher* (one coroutine) drains the results queue and issues batched `UPDATE … FROM unnest(...)` writes every `FLUSH_EVERY=500` rows or `FLUSH_AFTER=2s`, whichever first. One writer → no lock contention; consumers don't block on DB roundtrips.
 
-**Crash recovery** — on startup, `uploading` rows reset to `pending`; `in_progress` transfers are re-queued. The cursor only fetches `status = 'pending'` rows, so a resumed transfer picks up exactly where it left off.
+**No in-flight `'uploading'` state** — workers transition `pending → completed/failed` directly. Writing `'uploading'` on claim would mean 500k extra per-row UPDATEs and defeat the batched flusher. Tradeoff: a crash loses any results buffered in the flusher (≤500 rows or ≤2s of work). On restart those files are still `'pending'` and re-upload — but the idempotency check sees the object already in GCS with a matching MD5 and skips the actual upload, so the cost is just an extra HEAD per affected row.
+
+**LISTEN/NOTIFY over polling** — the trigger fires on INSERT or re-queue, so the daemon wakes instantly. The listener runs on a dedicated `asyncpg.connect()` (not borrowed from the pool) so it can't be stolen for other work and a slow listen callback can't block the pool.
+
+**Idempotent file uploads** — before uploading, check whether the GCS object exists and its MD5 matches the stored digest (`base64.b64decode(blob.md5_hash).hex()` vs `file.digest`). If so, record completed without re-uploading.
+
+**Crash recovery is implicit** — on startup, any `dataset_release_transfer` in `('queued','in_progress')` is re-enqueued. Because the claim CAS accepts both, a resumed transfer just re-runs the producer over remaining `'pending'` rows. Completed files stay completed; previously-failed files are reset by the claim transaction so a re-queue retries them.
+
+**Re-queue race is harmless** — startup-recovery and a brand-new NOTIFY for the same transfer can both land in the pending queue. The transfer semaphore serializes them, and the second invocation either no-ops (status already `'submitted'`, claim CAS returns no row) or resumes from where the first left off.
 
 **GCS rate limits** — GCS auto-scales write throughput but throttles new buckets at ~1000 writes/second initially. Use exponential backoff on 429/503. Consider ramping concurrency up over the first few minutes.
 
-**Atomic manifest step** — only mark the transfer `completed` after the manifest is durably in GCS. If the process dies between the GCS write and the DB update, the next run re-generates and re-uploads the manifest (safe — derived from `transfer_idc_file` rows which are already complete).
+**Manifest step** — only after every file reaches `'completed'`, the manifest CSV is built by querying `transfer_idc_file`, uploaded to `gs://{BUCKET}/transfers/{transfer_id}/manifest.csv`, and then `transfer_idc.gcs_url` and `dataset_release_transfer.transfer_status='submitted'` are updated together in one transaction. If the process dies between the GCS write and the DB update, the next run re-generates and re-uploads the manifest (cheap — file IDs are already complete).
+
+**GCS object naming** — files upload under `transfers/{transfer_id}/{file_id}`. The transfer-scoped prefix avoids collisions when two transfers happen to ship the same `file_id`, and the deterministic key trivially supports the idempotency HEAD check.
+
+**Observability** — a single transfer can run for hours. The skeleton logs structured lines at start, end, and on every per-file failure. For finer-grained progress, an operator can run:
+
+```sql
+SELECT status, COUNT(*) FROM transfer_idc_file
+ WHERE dataset_release_transfer_id = $1 GROUP BY status;
+```
 
 ---
 
@@ -233,23 +264,89 @@ ON CONFLICT DO NOTHING;  -- idempotent: safe to re-run if daemon crashes mid fan
 ```python
 # daemon.py
 import asyncio
+import base64
+import csv
+import io
+import logging
+import os
+
 import asyncpg
 from google.cloud import storage
 
-CONCURRENCY  = 200      # 512KB files are fast; high concurrency is appropriate
+DSN          = os.environ["TRANSFER_DAEMON_DSN"]
+BUCKET       = os.environ.get("TRANSFER_DAEMON_BUCKET", "posda_submit")
+CONCURRENCY  = 200          # per-transfer worker count
 MAX_ATTEMPTS = 3
-FLUSH_EVERY  = 500      # batch this many DB updates before flushing
-DSN    = "postgresql://..."
-BUCKET = "posda_submit"
+FLUSH_EVERY  = 500          # batch this many updates before flushing
+FLUSH_AFTER  = 2.0          # ...or after this many seconds, whichever first
+POOL_MIN     = 2
+POOL_MAX     = 6
+TRANSFER_PARALLELISM = 1    # at most one transfer in flight at a time
+NOTIFY_CHANNEL = "idc_transfer_channel"
+
+log = logging.getLogger("idc_transfer_daemon")
+_FLUSHER_DONE = object()  # sentinel for shutting down the flusher
+
+
+def derive_gcs_key(transfer_id: int, file_id: int) -> str:
+    # Per-transfer prefix avoids collisions across transfers that ship the same file_id.
+    return f"transfers/{transfer_id}/{file_id}"
+
+
+def gcs_md5_hex(blob: storage.Blob) -> str:
+    # GCS exposes md5 as base64; convert to hex to compare with file.digest.
+    return base64.b64decode(blob.md5_hash).hex()
+
+
+async def claim_transfer(pool, transfer_id):
+    """Atomic claim. Returns True iff this daemon now owns the transfer."""
+    async with pool.acquire() as conn, conn.transaction():
+        row = await conn.fetchrow(
+            """
+            UPDATE dataset_release_transfer
+               SET transfer_status = 'in_progress', when_updated = now()
+             WHERE dataset_release_transfer_id = $1
+               AND transfer_status IN ('queued', 'in_progress')
+            RETURNING dataset_release_transfer_id
+            """,
+            transfer_id,
+        )
+        if row is None:
+            return False
+
+        await conn.execute(
+            """
+            INSERT INTO transfer_idc_file
+                (dataset_release_transfer_id, file_id, local_path, md5, size_bytes)
+            SELECT $1, f.file_id, storage_path(f.file_id), f.digest, f.size
+              FROM transfer_recordset     tr
+              JOIN recordset_release_file rrf ON rrf.recordset_release_id = tr.recordset_release_id
+              JOIN file                   f   ON f.file_id                = rrf.file_id
+             WHERE tr.dataset_release_transfer_id = $1
+            ON CONFLICT (dataset_release_transfer_id, file_id) DO NOTHING
+            """,
+            transfer_id,
+        )
+
+        # On re-queue, give previously failed files another pass.
+        await conn.execute(
+            """
+            UPDATE transfer_idc_file
+               SET status='pending', attempts=0, error=NULL, updated_at=now()
+             WHERE dataset_release_transfer_id = $1 AND status = 'failed'
+            """,
+            transfer_id,
+        )
+    return True
 
 
 async def file_producer(pool, transfer_id, queue):
-    async with pool.acquire() as conn:
+    async with pool.acquire() as conn, conn.transaction():
         async for row in conn.cursor(
             """
-            SELECT transfer_idc_file_id AS id, local_path, md5, size_bytes, attempts
-            FROM transfer_idc_file
-            WHERE dataset_release_transfer_id = $1 AND status = 'pending'
+            SELECT transfer_idc_file_id AS id, file_id, local_path, md5, size_bytes, attempts
+              FROM transfer_idc_file
+             WHERE dataset_release_transfer_id = $1 AND status = 'pending'
             """,
             transfer_id,
             prefetch=1000,
@@ -259,39 +356,54 @@ async def file_producer(pool, transfer_id, queue):
         await queue.put(None)  # poison pills to shut down consumers
 
 
-async def file_consumer(pool, gcs_client, queue, buffer, lock):
+async def file_consumer(transfer_id, gcs_client, queue, results):
+    bucket = gcs_client.bucket(BUCKET)
     while True:
         row = await queue.get()
         if row is None:
-            break
+            return
 
-        bucket = gcs_client.bucket(BUCKET)
-        blob   = bucket.blob(derive_gcs_key(row["local_path"]))
+        key     = derive_gcs_key(transfer_id, row["file_id"])
+        blob    = bucket.blob(key)
+        gcs_url = f"gs://{BUCKET}/{key}"
 
         try:
             if await asyncio.to_thread(blob.exists):
                 await asyncio.to_thread(blob.reload)
                 if gcs_md5_hex(blob) == row["md5"]:
-                    result = (row["id"], "completed", blob.public_url, None, row["attempts"])
-                    await maybe_flush(pool, result, buffer, lock)
+                    await results.put((row["id"], "completed", gcs_url, None, row["attempts"]))
                     continue
 
             await asyncio.to_thread(blob.upload_from_filename, row["local_path"])
-            result = (row["id"], "completed", blob.public_url, None, row["attempts"])
+            await results.put((row["id"], "completed", gcs_url, None, row["attempts"]))
         except Exception as exc:
+            log.warning("upload failed transfer=%s file_id=%s err=%s",
+                        transfer_id, row["file_id"], exc)
             attempts = row["attempts"] + 1
             status   = "failed" if attempts >= MAX_ATTEMPTS else "pending"
-            result   = (row["id"], status, None, str(exc), attempts)
-
-        await maybe_flush(pool, result, buffer, lock)
+            await results.put((row["id"], status, None, str(exc), attempts))
 
 
-async def maybe_flush(pool, result, buffer, lock):
-    async with lock:
-        buffer.append(result)
-        if len(buffer) >= FLUSH_EVERY:
+async def flusher(pool, results):
+    """Single writer. Batches rows by size OR time, whichever first."""
+    buffer = []
+    while True:
+        try:
+            item = await asyncio.wait_for(results.get(), timeout=FLUSH_AFTER)
+        except asyncio.TimeoutError:
+            item = None  # timeout: time-based flush trigger
+
+        if item is _FLUSHER_DONE:
+            break
+        if item is not None:
+            buffer.append(item)
+
+        if buffer and (len(buffer) >= FLUSH_EVERY or item is None):
             await flush(pool, buffer)
             buffer.clear()
+
+    if buffer:
+        await flush(pool, buffer)
 
 
 async def flush(pool, buffer):
@@ -315,52 +427,58 @@ async def flush(pool, buffer):
     )
 
 
+async def build_and_upload_manifest(pool, gcs_client, transfer_id):
+    """Build a CSV of (file_id, gcs_url) and upload it to GCS. Returns its gs:// URL."""
+    rows = await pool.fetch(
+        "SELECT file_id, gcs_url FROM transfer_idc_file "
+        "WHERE dataset_release_transfer_id = $1 ORDER BY file_id",
+        transfer_id,
+    )
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["file_id", "gcs_url"])
+    for r in rows:
+        writer.writerow([r["file_id"], r["gcs_url"]])
+
+    bucket = gcs_client.bucket(BUCKET)
+    blob   = bucket.blob(f"transfers/{transfer_id}/manifest.csv")
+    await asyncio.to_thread(
+        blob.upload_from_string, buf.getvalue(), content_type="text/csv"
+    )
+    return f"gs://{BUCKET}/{blob.name}"
+
+
 async def process_transfer(pool, gcs_client, transfer_id):
-    # fan out files (idempotent)
-    await pool.execute(
-        """
-        INSERT INTO transfer_idc_file
-            (dataset_release_transfer_id, file_id, local_path, md5, size_bytes)
-        SELECT $1, f.file_id, storage_path(f.file_id), f.digest, f.size
-        FROM transfer_recordset     tr
-        JOIN recordset_release_file rrf ON rrf.recordset_release_id = tr.recordset_release_id
-        JOIN file                   f   ON f.file_id                = rrf.file_id
-        WHERE tr.dataset_release_transfer_id = $1
-        ON CONFLICT DO NOTHING
-        """,
-        transfer_id,
-    )
+    if not await claim_transfer(pool, transfer_id):
+        log.info("transfer=%s skipped (not claimable)", transfer_id)
+        return
 
-    await pool.execute(
-        "UPDATE dataset_release_transfer SET transfer_status='in_progress' "
-        "WHERE dataset_release_transfer_id=$1",
-        transfer_id,
-    )
+    log.info("transfer=%s starting", transfer_id)
 
-    queue  = asyncio.Queue(maxsize=CONCURRENCY * 2)
-    buffer = []
-    lock   = asyncio.Lock()
+    queue   = asyncio.Queue(maxsize=CONCURRENCY * 2)
+    results = asyncio.Queue()
 
+    flusher_task = asyncio.create_task(flusher(pool, results))
     consumers = [
-        asyncio.create_task(file_consumer(pool, gcs_client, queue, buffer, lock))
+        asyncio.create_task(file_consumer(transfer_id, gcs_client, queue, results))
         for _ in range(CONCURRENCY)
     ]
     await file_producer(pool, transfer_id, queue)
     await asyncio.gather(*consumers)
-
-    if buffer:
-        await flush(pool, buffer)
+    await results.put(_FLUSHER_DONE)
+    await flusher_task
 
     counts = await pool.fetchrow(
         """
-        SELECT
-            COUNT(*) FILTER (WHERE status = 'completed') AS ok,
-            COUNT(*) FILTER (WHERE status = 'failed')    AS bad
-        FROM transfer_idc_file
-        WHERE dataset_release_transfer_id = $1
+        SELECT COUNT(*) FILTER (WHERE status = 'completed') AS ok,
+               COUNT(*) FILTER (WHERE status = 'failed')    AS bad
+          FROM transfer_idc_file
+         WHERE dataset_release_transfer_id = $1
         """,
         transfer_id,
     )
+    log.info("transfer=%s files completed=%s failed=%s",
+             transfer_id, counts["ok"], counts["bad"])
 
     if counts["bad"] > 0:
         await pool.execute(
@@ -368,51 +486,65 @@ async def process_transfer(pool, gcs_client, transfer_id):
             "when_updated=now() WHERE dataset_release_transfer_id=$1",
             transfer_id,
         )
+        log.warning("transfer=%s marked failed", transfer_id)
         return
 
-    manifest_gcs_url = await build_and_upload_manifest(pool, gcs_client, transfer_id)
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute(
-                "UPDATE transfer_idc SET gcs_url=$1 WHERE dataset_release_transfer_id=$2",
-                manifest_gcs_url, transfer_id,
-            )
-            await conn.execute(
-                "UPDATE dataset_release_transfer SET transfer_status='completed', "
-                "when_updated=now() WHERE dataset_release_transfer_id=$1",
-                transfer_id,
-            )
+    manifest_url = await build_and_upload_manifest(pool, gcs_client, transfer_id)
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            "UPDATE transfer_idc SET gcs_url=$1 WHERE dataset_release_transfer_id=$2",
+            manifest_url, transfer_id,
+        )
+        await conn.execute(
+            "UPDATE dataset_release_transfer SET transfer_status='submitted', "
+            "when_updated=now() WHERE dataset_release_transfer_id=$1",
+            transfer_id,
+        )
+    log.info("transfer=%s submitted manifest=%s", transfer_id, manifest_url)
 
 
 async def recover_stale(pool):
-    await pool.execute(
-        "UPDATE transfer_idc_file SET status='pending', updated_at=now() WHERE status='uploading'"
-    )
-    return await pool.fetch(
+    """On startup, find every transfer that was already queued or in progress."""
+    rows = await pool.fetch(
         "SELECT dataset_release_transfer_id FROM dataset_release_transfer "
-        "WHERE transfer_status IN ('queued', 'in_progress')"
+        "WHERE transfer_status IN ('queued', 'in_progress') "
+        "ORDER BY dataset_release_transfer_id"
     )
+    return [r["dataset_release_transfer_id"] for r in rows]
 
 
 async def daemon():
-    pool = await asyncpg.create_pool(DSN)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+    pool = await asyncpg.create_pool(DSN, min_size=POOL_MIN, max_size=POOL_MAX)
     gcs  = storage.Client()
 
-    stale   = await recover_stale(pool)
-    pending = asyncio.Queue()
+    pending      = asyncio.Queue()
+    transfer_sem = asyncio.Semaphore(TRANSFER_PARALLELISM)
 
-    async def on_notify(conn, pid, channel, payload):
+    async def on_notify(_conn, _pid, _channel, payload):
         await pending.put(int(payload))
 
-    listen_conn = await pool.acquire()
-    await listen_conn.add_listener("idc_transfer_channel", on_notify)
+    # Dedicated connection for LISTEN — not borrowed from the pool.
+    listen_conn = await asyncpg.connect(DSN)
+    await listen_conn.add_listener(NOTIFY_CHANNEL, on_notify)
 
-    for row in stale:
-        await pending.put(row["dataset_release_transfer_id"])
+    for transfer_id in await recover_stale(pool):
+        await pending.put(transfer_id)
+
+    async def run_one(transfer_id):
+        async with transfer_sem:
+            try:
+                await process_transfer(pool, gcs, transfer_id)
+            except Exception:
+                log.exception("transfer=%s crashed", transfer_id)
 
     while True:
         transfer_id = await pending.get()
-        asyncio.create_task(process_transfer(pool, gcs, transfer_id))
+        asyncio.create_task(run_one(transfer_id))
 
 
 if __name__ == "__main__":
@@ -423,19 +555,9 @@ if __name__ == "__main__":
 
 ## Open Questions
 
-1. **`transfer_status` vocabulary** — should `'completed'` be the final state, or should we use the existing `'submitted'`? Confirm with the Posda team what downstream code checks for.
+1. **`storage_path()` and multiple locations** — the existing function does not filter by `is_home`. If a file has multiple `file_location` rows the function returns an indeterminate row. Clarify whether `is_home = 'y'` should be used as the filter (or whether such ambiguity should fail loudly during fan-out).
 
-2. **`storage_path()` and multiple locations** — the existing function does not filter by `is_home`. If a file has multiple `file_location` rows the function returns an indeterminate row. Clarify whether `is_home = 'y'` should be used as the filter.
-
-3. **Manifest format** — what format does IDC expect? CSV, JSON, JSONL? Which fields are required (just `gcs_url`, or also `file_id`, `md5`, `size`)?
-
-4. **`transfer_recordset.retriever_manifest_file_id`** — should the manifest be recorded here, in `transfer_idc.recordset_manifest_file_id`, or both?
-
-5. **`ON CONFLICT DO NOTHING`** — the fan-out INSERT needs a unique constraint on `(dataset_release_transfer_id, file_id)` in `transfer_idc_file` for this clause to work. Add it:
-   ```sql
-   ALTER TABLE transfer_idc_file
-       ADD CONSTRAINT uq_transfer_idc_file UNIQUE (dataset_release_transfer_id, file_id);
-   ```
+2. **Manifest registration in Posda** — the CSV manifest (file_id, gcs_url) lives in GCS and its URL goes in `transfer_idc.gcs_url`. Separately, `transfer_idc.dataset_manifest_file_id`, `transfer_idc.recordset_manifest_file_id`, `transfer_idc.clinical_manifest_file_id`, and `transfer_recordset.retriever_manifest_file_id` are FKs into the Posda `file` table. Does the manifest CSV also need to be registered as a Posda-tracked file with one (or more) of those columns populated? If so, which?
 
 ---
 

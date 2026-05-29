@@ -6,14 +6,16 @@ def main():
     print("Hello from tcia-to-idc-pipeline!")
 
     # uploading a very large file
-    upload_file("big.dat")
+    # upload_file("big.dat")
 
     # a much smaller file
-    # upload_file("main.py")
+    upload_file("main.py")
 
 
 def upload_file(filename):
-    client = storage.Client(project='pacific-ethos-162617')
+    client = storage.Client.from_service_account_json(
+        "sa-key.json", project="tcia-data-transfers"
+    )
     bucket = client.bucket("posda_submit")
 
     blob = bucket.blob(filename)
