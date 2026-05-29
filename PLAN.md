@@ -19,7 +19,7 @@ dataset_release_transfer
     destination_id               FK → transfer_destination
     transfer_name
     transfer_mode_id             FK → transfer_mode
-    transfer_status              text  -- 'draft' | 'queued' | 'submitted' | 'failed'
+    transfer_status              text  -- 'draft' | 'queued' | 'success' | 'failed'
     transfer_notes
     when_created / who_created / when_updated / who_updated
 ```
@@ -39,7 +39,7 @@ transfer_idc
     public
 ```
 
-A companion row is created in `transfer_idc` for every IDC-destined transfer. The `gcs_url` and manifest file IDs are populated by the daemon when the transfer completes.
+A companion row is created in `transfer_idc` for every IDC-destined transfer. The manifest file IDs (`dataset_manifest_file_id` etc.) are populated by the external queuing process *before* the transfer is set to `'queued'` — they reference manifest files already registered in Posda's `file` table. The daemon reads `dataset_manifest_file_id` to find the manifest's local path, uploads it to GCS, and writes the resulting URL into `gcs_url` on success.
 
 ### Recordset link — `transfer_recordset`
 
@@ -106,15 +106,15 @@ WHERE drt.dataset_release_transfer_id = $1
 
 ### 1. Extend `transfer_status` vocabulary
 
-The existing `transfer_status` values on `dataset_release_transfer` are `'draft'`, `'queued'`, `'submitted'`, `'failed'`. We need one more:
+The existing `transfer_status` values on `dataset_release_transfer` are `'draft'`, `'queued'`, `'success'`, `'failed'`. We need one more:
 
 - `'in_progress'` — daemon has started uploading files
 
-The terminal success state remains `'submitted'`. The schema column comment already lists `'submitted'` as the valid completion value, and reusing it avoids vocabulary drift between this daemon and the rest of the Posda system.
+The terminal success state is `'success'`, the schema's defined completion value — the daemon sets it once every file has uploaded and the manifest is written.
 
 ### 2. New table: `transfer_idc_file`
 
-Follows the existing naming pattern (`transfer_idc` is the IDC-specific extension table). This is a **snapshot** of the work for a specific transfer — not a live view into the source tables — so a single `recordset_release` can appear in many transfers without conflict.
+Follows the existing naming pattern (`transfer_idc` is the IDC-specific extension table). It materializes one row per file in the transfer — a **snapshot of which files** belong to this transfer (not a live view into the source recordset), so a single `recordset_release` can appear in many transfers without conflict, and per-file status/retry state has somewhere to live. The file's path, MD5, and size are *not* copied here; they are re-joined from the source tables at stream time (see the producer query) to keep this table compact at ~500k rows per transfer.
 
 ```sql
 CREATE TABLE public.transfer_idc_file (
@@ -123,10 +123,7 @@ CREATE TABLE public.transfer_idc_file (
         REFERENCES public.dataset_release_transfer(dataset_release_transfer_id) ON DELETE CASCADE,
     file_id                     integer NOT NULL
         REFERENCES public.file(file_id),
-    local_path                  text    NOT NULL,  -- snapshot of storage_path() at fan-out time
-    md5                         text    NOT NULL,  -- snapshot of file.digest
-    size_bytes                  bigint  NOT NULL,  -- snapshot of file.size (bigint: files can exceed 2GB)
-    gcs_url                     text,              -- populated on success
+    gcs_url                     text    NOT NULL,  -- populated by the external fan-out as <base_path>/<md5>; the daemon never writes it
     status                      text    NOT NULL DEFAULT 'pending',
         -- 'pending' | 'completed' | 'failed'
     error                       text,              -- last error message
@@ -138,7 +135,7 @@ CREATE TABLE public.transfer_idc_file (
 CREATE INDEX ON public.transfer_idc_file(dataset_release_transfer_id, status, transfer_idc_file_id);  -- covers the producer's keyset pagination
 ```
 
-`local_path`, `md5`, and `size_bytes` are copied at snapshot time so workers have everything they need without re-joining, and the GCS idempotency check uses the stored MD5 directly.
+The table stores `(dataset_release_transfer_id, file_id)` membership, the pre-computed destination `gcs_url`, and per-row status/retry bookkeeping. The `gcs_url` is written once at fan-out time (see *Transfer Preparation* below) and treated as immutable by the daemon — it tells each worker *where* to upload. The local path and MD5 a worker needs are recovered by joining `transfer_idc_file → file → file_location → file_storage_root` in the producer's paginated query (size isn't needed by the upload path at all). At 1000 rows/page this set-based join is cheaper than 1000 per-row `storage_path()` calls.
 
 ### 3. LISTEN/NOTIFY trigger
 
@@ -162,6 +159,30 @@ Fires on both INSERT and UPDATE so that manually re-queuing a failed transfer al
 
 ---
 
+## Transfer Preparation (External)
+
+Before a `dataset_release_transfer` is flipped to `'queued'`, **a separate process** (not this daemon) fans the recordset out into `transfer_idc_file`, computing each row's destination `gcs_url` from a caller-supplied base path. The daemon only reads from these rows; it never inserts into `transfer_idc_file`.
+
+The SQL is parameterised by `$1 = dataset_release_transfer_id` and `$2 = base_path` (e.g. `'gs://posda_submit/some-collection/v1/t3'`):
+
+```sql
+INSERT INTO public.transfer_idc_file
+    (dataset_release_transfer_id, file_id, gcs_url)
+SELECT
+    $1,
+    rrf.file_id,
+    $2 || '/' || f.digest
+FROM transfer_recordset      tr
+JOIN recordset_release_file  rrf ON rrf.recordset_release_id = tr.recordset_release_id
+JOIN file                    f   ON f.file_id                = rrf.file_id
+WHERE tr.dataset_release_transfer_id = $1
+ON CONFLICT (dataset_release_transfer_id, file_id) DO NOTHING;
+```
+
+Object names are content-addressed (`<base_path>/<md5>`). Two transfers shipping the same file_id with the same digest will compute the same URL — the daemon's idempotency check (HEAD by name, verify MD5) then makes the upload a no-op. The `ON CONFLICT` keeps the fan-out itself re-runnable.
+
+---
+
 ## Daemon Architecture
 
 A single **asyncio-based daemon**. GCS uploads are pure I/O, so async with a producer/consumer queue and bounded concurrency is the right tool. Postgres is already the source of truth — no external queue (Celery, Redis, etc.) needed.
@@ -179,53 +200,32 @@ Event loop (LISTEN/NOTIFY on 'idc_transfer_channel' + startup recovery)
             ├─ UPDATE dataset_release_transfer SET transfer_status='in_progress'
             │    WHERE id=$1 AND transfer_status IN ('queued','in_progress')
             │    RETURNING id        -- bail out if no row returned (not claimable)
-            ├─ Fan out: INSERT transfer_idc_file via INSERT … SELECT
-            │    (ON CONFLICT DO NOTHING — idempotent on resume)
             └─ Reset any previously-failed files: UPDATE transfer_idc_file
                  SET status='pending', attempts=0, error=NULL WHERE status='failed'
                  (so re-queuing a failed transfer retries them)
        └─ Producer: keyset-paginate status='pending' rows (1000/page, id > last) into a bounded queue
-       └─ Consumers (N workers) pull from queue and upload, retrying inline
+            (joins file/file_location/file_storage_root for local_path and md5; gcs_url is on the row)
+       └─ Consumers (N workers) pull from queue and upload to row.gcs_url, retrying inline
             ├─ Idempotency: single get_blob → object present + MD5 matches → record completed, skip upload
             ├─ Inline retry with exponential backoff up to MAX_ATTEMPTS; emit only terminal states
-            ├─ On success: push (id, 'completed', gs://…, None, attempts) to results queue
-            └─ After MAX_ATTEMPTS: push (id, 'failed', None, error, attempts)
+            ├─ On success: push (id, 'completed', None, attempts) to results queue
+            └─ After MAX_ATTEMPTS: push (id, 'failed', error, attempts)
        └─ Flusher coroutine drains the results queue and writes UPDATEs in batches
             (FLUSH_EVERY=500 rows or FLUSH_AFTER=2s since first buffered row, whichever first)
 
 After every file reaches a terminal state
   └─ If any row is not 'completed':  UPDATE dataset_release_transfer SET transfer_status='failed'
   └─ If all rows 'completed':
-       ├─ Generate manifest CSV (file_id, gcs_url) from transfer_idc_file
-       ├─ Upload manifest to gs://{BUCKET}/transfers/{transfer_id}/manifest.csv
+       ├─ Look up transfer_idc.dataset_manifest_file_id → local path via file_location join
+       ├─ Upload that file to <base_path>/manifest.csv (base_path recovered from any row's gcs_url)
        └─ In one transaction:
             ├─ UPDATE transfer_idc SET gcs_url = manifest_url
-            └─ UPDATE dataset_release_transfer SET transfer_status = 'submitted'
-```
-
-### Fan-out SQL (single statement, no Python loop)
-
-Runs inside the claim transaction (see [Atomic claim](#key-design-decisions)):
-
-```sql
-INSERT INTO public.transfer_idc_file
-    (dataset_release_transfer_id, file_id, local_path, md5, size_bytes)
-SELECT
-    $1,
-    f.file_id,
-    storage_path(f.file_id),
-    f.digest,
-    f.size
-FROM transfer_recordset      tr
-JOIN recordset_release_file  rrf ON rrf.recordset_release_id = tr.recordset_release_id
-JOIN file                    f   ON f.file_id                = rrf.file_id
-WHERE tr.dataset_release_transfer_id = $1
-ON CONFLICT (dataset_release_transfer_id, file_id) DO NOTHING;  -- idempotent on resume
+            └─ UPDATE dataset_release_transfer SET transfer_status = 'success'
 ```
 
 ### Key Design Decisions
 
-**Atomic claim** — the transition `queued → in_progress` is a conditional `UPDATE … WHERE transfer_status IN ('queued','in_progress') RETURNING id` issued *inside the same transaction* as the fan-out INSERT and the failed-file reset. If no row is returned, this daemon doesn't own the transfer (another instance got it, or it's already past `in_progress`) and the worker bails out. This makes the daemon safe under restarts and brief deploy-time overlaps.
+**Atomic claim** — the transition `queued → in_progress` is a conditional `UPDATE … WHERE transfer_status IN ('queued','in_progress') RETURNING id` issued *inside the same transaction* as the failed-file reset. If no row is returned, this daemon doesn't own the transfer (another instance got it, or it's already past `in_progress`) and the worker bails out. This makes the daemon safe under restarts and brief deploy-time overlaps. Fan-out has already happened externally before queuing, so the claim transaction is just CAS + reset.
 
 **Single-transfer serialization** — `TRANSFER_PARALLELISM=1`. With ~256GB per transfer and a ~1000 writes/sec GCS budget, running two transfers concurrently just halves throughput for each while doubling the failure surface. A semaphore in front of `process_transfer` enforces this; raise it later if a real reason emerges.
 
@@ -245,13 +245,13 @@ ON CONFLICT (dataset_release_transfer_id, file_id) DO NOTHING;  -- idempotent on
 
 **Crash recovery is implicit** — on startup (and on every listener reconnect, and every `RECONCILE_INTERVAL` via the reconcile loop), any `dataset_release_transfer` in `('queued','in_progress')` is re-enqueued. Because the claim CAS accepts both, a resumed transfer just re-runs the producer over remaining `'pending'` rows. Completed files stay completed; previously-failed files are reset by the claim transaction so a re-queue retries them. The `inflight` set keeps these overlapping re-enqueues from stacking duplicate runs of the same transfer.
 
-**Re-queue race is harmless** — startup-recovery and a brand-new NOTIFY for the same transfer can both land in the pending queue. The transfer semaphore serializes them, and the second invocation either no-ops (status already `'submitted'`, claim CAS returns no row) or resumes from where the first left off.
+**Re-queue race is harmless** — startup-recovery and a brand-new NOTIFY for the same transfer can both land in the pending queue. The transfer semaphore serializes them, and the second invocation either no-ops (status already `'success'`, claim CAS returns no row) or resumes from where the first left off.
 
 **GCS rate limits** — GCS auto-scales write throughput but throttles new buckets at ~1000 writes/second initially. Use exponential backoff on 429/503. Consider ramping concurrency up over the first few minutes.
 
-**Manifest step** — only after every file reaches `'completed'`, the manifest CSV is built by querying `transfer_idc_file`, uploaded to `gs://{BUCKET}/transfers/{transfer_id}/manifest.csv`, and then `transfer_idc.gcs_url` and `dataset_release_transfer.transfer_status='submitted'` are updated together in one transaction. If the process dies between the GCS write and the DB update, the next run re-generates and re-uploads the manifest (cheap — file IDs are already complete).
+**Manifest step** — the manifest itself is built externally and registered as a Posda file ahead of time; `transfer_idc.dataset_manifest_file_id` points to it. Only after every file in the transfer reaches `'completed'`, the daemon resolves that file_id to a local path (`file_location → file_storage_root`), uploads it to `<base_path>/manifest.csv`, and writes its `gs://` URL into `transfer_idc.gcs_url` together with `dataset_release_transfer.transfer_status='success'` in one transaction. `<base_path>` is recovered by stripping the trailing `/<md5>` from any transfer_idc_file row's `gcs_url` — every row in the transfer was fanned out with the same base path, so no extra schema column is needed. If the process dies between the GCS write and the DB update, the next run re-uploads the manifest (cheap — the bytes already exist locally and in GCS, the upload is the idempotent operation).
 
-**GCS object naming** — files upload under `transfers/{transfer_id}/{file_id}`. The transfer-scoped prefix avoids collisions when two transfers happen to ship the same `file_id`, and the deterministic key trivially supports the idempotency HEAD check.
+**GCS object naming is set externally** — each row's `gcs_url` is written by the external fan-out as `<base_path>/<md5>` and is the daemon's source of truth for where the file goes. The daemon parses the URL into bucket + object name per row; nothing about the bucket is hard-coded in the daemon. The content-addressed layout is also why idempotency works: a file with a known digest always lands at the same URL, so the HEAD-and-verify check is correct across re-runs.
 
 **Observability** — a single transfer can run for hours. The skeleton logs structured lines at start, end, and on every per-file failure. For finer-grained progress, an operator can run:
 
@@ -268,8 +268,6 @@ SELECT status, COUNT(*) FROM transfer_idc_file
 # daemon.py
 import asyncio
 import base64
-import csv
-import io
 import logging
 import os
 import signal
@@ -281,7 +279,6 @@ import requests
 from google.cloud import storage
 
 DSN          = os.environ["TRANSFER_DAEMON_DSN"]
-BUCKET       = os.environ.get("TRANSFER_DAEMON_BUCKET", "posda_submit")
 CONCURRENCY  = 200          # per-transfer worker count
 MAX_ATTEMPTS = 3            # inline upload retries per file before giving up
 BACKOFF_BASE = 0.5          # seconds; exponential backoff between retries
@@ -309,9 +306,14 @@ def make_gcs_client() -> storage.Client:
     return client
 
 
-def derive_gcs_key(transfer_id: int, file_id: int) -> str:
-    # Per-transfer prefix avoids collisions across transfers that ship the same file_id.
-    return f"transfers/{transfer_id}/{file_id}"
+def parse_gs_url(url: str) -> tuple[str, str]:
+    # "gs://bucket/path/to/object" → ("bucket", "path/to/object")
+    if not url.startswith("gs://"):
+        raise ValueError(f"not a gs:// URL: {url!r}")
+    bucket, _, name = url[5:].partition("/")
+    if not bucket or not name:
+        raise ValueError(f"malformed gs:// URL: {url!r}")
+    return bucket, name
 
 
 def gcs_md5_hex(blob: storage.Blob) -> str | None:
@@ -339,19 +341,8 @@ async def claim_transfer(pool, transfer_id):
         if row is None:
             return False
 
-        await conn.execute(
-            """
-            INSERT INTO transfer_idc_file
-                (dataset_release_transfer_id, file_id, local_path, md5, size_bytes)
-            SELECT $1, f.file_id, storage_path(f.file_id), f.digest, f.size
-              FROM transfer_recordset     tr
-              JOIN recordset_release_file rrf ON rrf.recordset_release_id = tr.recordset_release_id
-              JOIN file                   f   ON f.file_id                = rrf.file_id
-             WHERE tr.dataset_release_transfer_id = $1
-            ON CONFLICT (dataset_release_transfer_id, file_id) DO NOTHING
-            """,
-            transfer_id,
-        )
+        # Fan-out into transfer_idc_file happened externally before this transfer
+        # was queued; the daemon does not insert into transfer_idc_file.
 
         # On re-queue, give previously failed files another pass.
         await conn.execute(
@@ -368,16 +359,26 @@ async def claim_transfer(pool, transfer_id):
 async def file_producer(pool, transfer_id, queue):
     # Keyset pagination in short autocommit queries — no hours-long open
     # transaction pinning the xmin horizon while 500k rows churn.
+    # local_path and md5 are re-joined here rather than stored on transfer_idc_file.
+    # file_location has exactly one row per file_id (a unique index is planned).
     last_id = 0
     while True:
         rows = await pool.fetch(
             """
-            SELECT transfer_idc_file_id AS id, file_id, local_path, md5, size_bytes, attempts
-              FROM transfer_idc_file
-             WHERE dataset_release_transfer_id = $1
-               AND status = 'pending'
-               AND transfer_idc_file_id > $2
-             ORDER BY transfer_idc_file_id
+            SELECT tif.transfer_idc_file_id              AS id,
+                   tif.file_id                           AS file_id,
+                   tif.gcs_url                           AS gcs_url,
+                   fsr.root_path || '/' || fl.rel_path   AS local_path,
+                   f.digest                              AS md5,
+                   tif.attempts                          AS attempts
+              FROM transfer_idc_file  tif
+              JOIN file               f   ON f.file_id   = tif.file_id
+              JOIN file_location      fl  ON fl.file_id  = tif.file_id
+              JOIN file_storage_root  fsr ON fsr.file_storage_root_id = fl.file_storage_root_id
+             WHERE tif.dataset_release_transfer_id = $1
+               AND tif.status = 'pending'
+               AND tif.transfer_idc_file_id > $2
+             ORDER BY tif.transfer_idc_file_id
              LIMIT 1000
             """,
             transfer_id, last_id,
@@ -391,28 +392,29 @@ async def file_producer(pool, transfer_id, queue):
         await queue.put(None)  # poison pills to shut down consumers
 
 
-async def upload_one(transfer_id, bucket, row):
+async def upload_one(transfer_id, gcs_client, row):
     """Upload one file with inline retry+backoff. Returns a *terminal* result tuple.
 
     The producer streams each row exactly once, so a worker must drive its file
-    all the way to 'completed' or 'failed' here — there is no second pass."""
-    key      = derive_gcs_key(transfer_id, row["file_id"])
-    gcs_url  = f"gs://{BUCKET}/{key}"
+    all the way to 'completed' or 'failed' here — there is no second pass.
+    The destination is whatever URL the external fan-out wrote into row['gcs_url']."""
+    bucket_name, object_name = parse_gs_url(row["gcs_url"])
+    bucket   = gcs_client.bucket(bucket_name)
     attempts = row["attempts"]
     last_err = None
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         attempts += 1
         try:
-            existing = await asyncio.to_thread(bucket.get_blob, key)  # one HEAD: None or metadata
+            existing = await asyncio.to_thread(bucket.get_blob, object_name)  # one HEAD
             if existing is not None and gcs_md5_hex(existing) == row["md5"]:
-                return (row["id"], "completed", gcs_url, None, attempts)
+                return (row["id"], "completed", None, attempts)
 
-            blob = bucket.blob(key)
+            blob = bucket.blob(object_name)
             await asyncio.to_thread(
                 blob.upload_from_filename, row["local_path"], checksum="md5"
             )  # checksum="md5" → GCS rejects a corrupted round trip
-            return (row["id"], "completed", gcs_url, None, attempts)
+            return (row["id"], "completed", None, attempts)
         except Exception as exc:
             last_err = exc
             log.warning("upload failed transfer=%s file_id=%s attempt=%s err=%s",
@@ -420,16 +422,15 @@ async def upload_one(transfer_id, bucket, row):
             if attempt < MAX_ATTEMPTS:
                 await asyncio.sleep(BACKOFF_BASE * 2 ** (attempt - 1))
 
-    return (row["id"], "failed", None, str(last_err), attempts)
+    return (row["id"], "failed", str(last_err), attempts)
 
 
 async def file_consumer(transfer_id, gcs_client, queue, results):
-    bucket = gcs_client.bucket(BUCKET)
     while True:
         row = await queue.get()
         if row is None:
             return
-        await results.put(await upload_one(transfer_id, bucket, row))
+        await results.put(await upload_one(transfer_id, gcs_client, row))
 
 
 async def flusher(pool, results):
@@ -461,46 +462,65 @@ async def flusher(pool, results):
 
 
 async def flush(pool, buffer):
+    # gcs_url is owned by the external fan-out and never written here.
     await pool.execute(
         """
         UPDATE transfer_idc_file SET
             status     = u.status,
-            gcs_url    = u.gcs_url,
             error      = u.error,
             attempts   = u.attempts,
             updated_at = now()
-        FROM unnest($1::int[], $2::text[], $3::text[], $4::text[], $5::int[])
-            AS u(id, status, gcs_url, error, attempts)
+        FROM unnest($1::int[], $2::text[], $3::text[], $4::int[])
+            AS u(id, status, error, attempts)
         WHERE transfer_idc_file.transfer_idc_file_id = u.id
         """,
         [r[0] for r in buffer],
         [r[1] for r in buffer],
         [r[2] for r in buffer],
         [r[3] for r in buffer],
-        [r[4] for r in buffer],
     )
 
 
-async def build_and_upload_manifest(pool, gcs_client, transfer_id):
-    """Build a CSV of (file_id, gcs_url) and upload it to GCS. Returns its gs:// URL."""
-    rows = await pool.fetch(
-        "SELECT file_id, gcs_url FROM transfer_idc_file "
-        "WHERE dataset_release_transfer_id = $1 AND status = 'completed' "
-        "ORDER BY file_id",
+async def upload_manifest(pool, gcs_client, transfer_id):
+    """Upload the externally-prepared manifest from Posda to GCS.
+
+    The manifest is created upstream and registered as a Posda file referenced
+    by transfer_idc.dataset_manifest_file_id; the daemon does not generate it.
+    Destination is '<base_path>/manifest.csv', where <base_path> is recovered
+    by stripping the trailing /<md5> from any transfer_idc_file row's gcs_url.
+    Returns the manifest's gs:// URL."""
+    manifest = await pool.fetchrow(
+        """
+        SELECT fsr.root_path || '/' || fl.rel_path AS local_path
+          FROM transfer_idc       ti
+          JOIN file_location      fl  ON fl.file_id = ti.dataset_manifest_file_id
+          JOIN file_storage_root  fsr ON fsr.file_storage_root_id = fl.file_storage_root_id
+         WHERE ti.dataset_release_transfer_id = $1
+        """,
         transfer_id,
     )
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["file_id", "gcs_url"])
-    for r in rows:
-        writer.writerow([r["file_id"], r["gcs_url"]])
+    if manifest is None:
+        raise RuntimeError(
+            f"transfer={transfer_id}: transfer_idc.dataset_manifest_file_id missing "
+            "or its file has no location — external setup did not run"
+        )
 
-    bucket = gcs_client.bucket(BUCKET)
-    blob   = bucket.blob(f"transfers/{transfer_id}/manifest.csv")
-    await asyncio.to_thread(
-        blob.upload_from_string, buf.getvalue(), content_type="text/csv"
+    sample = await pool.fetchval(
+        "SELECT gcs_url FROM transfer_idc_file "
+        "WHERE dataset_release_transfer_id = $1 LIMIT 1",
+        transfer_id,
     )
-    return f"gs://{BUCKET}/{blob.name}"
+    base_path    = sample.rsplit("/", 1)[0]  # strip trailing /<md5>
+    manifest_url = f"{base_path}/manifest.csv"
+
+    bucket_name, object_name = parse_gs_url(manifest_url)
+    blob = gcs_client.bucket(bucket_name).blob(object_name)
+    await asyncio.to_thread(
+        blob.upload_from_filename,
+        manifest["local_path"],
+        checksum="md5",
+    )
+    return manifest_url
 
 
 async def process_transfer(pool, gcs_client, transfer_id):
@@ -535,8 +555,9 @@ async def process_transfer(pool, gcs_client, transfer_id):
     log.info("transfer=%s files completed=%s incomplete=%s",
              transfer_id, counts["ok"], counts["not_ok"])
 
-    if counts["not_ok"] > 0:
-        # Any non-'completed' row (failed *or* still pending) blocks submission.
+    if counts["not_ok"] > 0 or counts["ok"] == 0:
+        # Any non-'completed' row blocks submission. ok==0 catches the empty case
+        # (external fan-out didn't run, or recordset was empty) — refuse to mark success.
         await pool.execute(
             "UPDATE dataset_release_transfer SET transfer_status='failed', "
             "when_updated=now(), who_updated='idc_transfer_daemon' "
@@ -546,19 +567,19 @@ async def process_transfer(pool, gcs_client, transfer_id):
         log.warning("transfer=%s marked failed", transfer_id)
         return
 
-    manifest_url = await build_and_upload_manifest(pool, gcs_client, transfer_id)
+    manifest_url = await upload_manifest(pool, gcs_client, transfer_id)
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(
             "UPDATE transfer_idc SET gcs_url=$1 WHERE dataset_release_transfer_id=$2",
             manifest_url, transfer_id,
         )
         await conn.execute(
-            "UPDATE dataset_release_transfer SET transfer_status='submitted', "
+            "UPDATE dataset_release_transfer SET transfer_status='success', "
             "when_updated=now(), who_updated='idc_transfer_daemon' "
             "WHERE dataset_release_transfer_id=$1",
             transfer_id,
         )
-    log.info("transfer=%s submitted manifest=%s", transfer_id, manifest_url)
+    log.info("transfer=%s succeeded manifest=%s", transfer_id, manifest_url)
 
 
 async def recover_stale(db):
@@ -669,13 +690,7 @@ if __name__ == "__main__":
 
 ## Open Questions
 
-1. **`storage_path()` and multiple locations** — the existing function does not filter by `is_home`. If a file has multiple `file_location` rows the function returns an indeterminate row. Clarify whether `is_home = 'y'` should be used as the filter (or whether such ambiguity should fail loudly during fan-out).
-
-2. **Manifest registration in Posda** — the CSV manifest (file_id, gcs_url) lives in GCS and its URL goes in `transfer_idc.gcs_url`. Separately, `transfer_idc.dataset_manifest_file_id`, `transfer_idc.recordset_manifest_file_id`, `transfer_idc.clinical_manifest_file_id`, and `transfer_recordset.retriever_manifest_file_id` are FKs into the Posda `file` table. Does the manifest CSV also need to be registered as a Posda-tracked file with one (or more) of those columns populated? If so, which?
-
-3. **GCS object layout & manifest format vs IDC ingestion** — objects are keyed by opaque `file_id` (`transfers/{transfer_id}/{file_id}`), and the manifest is a minimal `(file_id, gcs_url)` CSV. The original uploader (`main.py`) instead preserved the source directory structure. Confirm what IDC's ingestion actually requires: a specific bucket/key layout, and whether the manifest needs extra columns (e.g. MD5, size, or DICOM `SOPInstanceUID`) rather than just `file_id,gcs_url`.
-
-4. **`who_updated` column type** — the daemon writes the sentinel `'idc_transfer_daemon'` to `who_updated`. This assumes the column is free text (the Posda convention). If it is actually a FK to a users table, the daemon needs a real service-account row instead.
+1. **`who_updated` column type** — the daemon writes the sentinel `'idc_transfer_daemon'` to `who_updated`. This assumes the column is free text (the Posda convention). If it is actually a FK to a users table, the daemon needs a real service-account row instead.
 
 ---
 
