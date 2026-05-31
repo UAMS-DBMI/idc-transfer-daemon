@@ -1,4 +1,4 @@
-# tcia-to-idc-pipeline
+# idc-transfer-daemon
 
 A Go daemon that ships file transfers from Posda (the TCIA submissions system) to
 Google Cloud Storage buckets that NCI's Imaging Data Commons (IDC) ingests from.
