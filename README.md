@@ -52,6 +52,12 @@ Environment variables:
 - `TRANSFER_DAEMON_DSN` — Postgres DSN for the Posda database (required).
 - `GCS_KEY_FILE` — path to a GCS service-account key file (required at runtime;
   see `src/Makefile` for the Docker invocation used during development).
+- `GELF_ADDR` — optional `host:port` for a GELF UDP log target (e.g.
+  `graylog:12201`). When set, logs fan out to stderr *and* GELF; when unset,
+  stderr only. A dial failure at startup falls back to stderr-only.
+- `GELF_TAG` — optional value for the `_tag` field on every GELF record.
+  Defaults to `idc-transfer-daemon`. Useful when several daemons share a
+  Graylog instance and need distinct routing.
 
 ## Running locally
 
