@@ -1,0 +1,15 @@
+Dockerfile
+.dockerignore
+.git
+.gitignore
+
+# Prebuilt host binary — would otherwise bloat the build context by ~50 MB.
+idc-transfer-daemon
+
+# Never bake credentials into the image. Mount at runtime instead.
+sa-key.json
+*.env
+
+# Local notes / plans.
+PLAN.md
+*.md

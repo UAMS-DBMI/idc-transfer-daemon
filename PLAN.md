@@ -185,7 +185,7 @@ Object names are content-addressed (`<base_path>/<md5>`). Two transfers shipping
 
 ## Daemon Architecture
 
-A single **asyncio-based daemon**. GCS uploads are pure I/O, so async with a producer/consumer queue and bounded concurrency is the right tool. Postgres is already the source of truth — no external queue (Celery, Redis, etc.) needed.
+A single **Go daemon** built on goroutines + channels. GCS uploads are pure I/O, and Go's native concurrency model (goroutines + buffered channels + `context.Context`) is a one-to-one fit for the producer/consumer/flusher shape this workload wants. Postgres is already the source of truth — no external queue (Celery, Redis, etc.) needed.
 
 ### Processing Flow
 
@@ -229,19 +229,19 @@ After every file reaches a terminal state
 
 **Single-transfer serialization** — `TRANSFER_PARALLELISM=1`. With ~256GB per transfer and a ~1000 writes/sec GCS budget, running two transfers concurrently just halves throughput for each while doubling the failure surface. A semaphore in front of `process_transfer` enforces this; raise it later if a real reason emerges.
 
-**Producer / consumer / flusher** — three coroutine roles per transfer:
+**Producer / consumer / flusher** — three goroutine roles per transfer, coordinated by an `errgroup.Group` so the first error tears the pipeline down cleanly:
 
-- *Producer* keyset-paginates `status='pending'` rows (`WHERE transfer_idc_file_id > $last … LIMIT 1000`) in short autocommit queries into a bounded `asyncio.Queue`. No 500k-row memory blow-up, the bounded queue provides backpressure, and — unlike a single server-side cursor held open for the whole transfer — it never pins the xmin horizon for hours (which would stall autovacuum on the heavily-updated `transfer_idc_file`).
-- *Consumers* (`CONCURRENCY` workers) pull rows, do the GCS work **with inline retry + exponential backoff**, and push only *terminal* result tuples to a separate results queue. They never touch the DB directly. Inline retry is load-bearing: the producer streams each pending row exactly once, so a worker must drive its file all the way to `completed`/`failed` itself — there is no second pass that would re-pick a row left at `pending`.
-- *Flusher* (one coroutine) drains the results queue and issues batched `UPDATE … FROM unnest(...)` writes every `FLUSH_EVERY=500` rows or `FLUSH_AFTER=2s` measured from the first buffered row, whichever first. One writer → no lock contention; consumers don't block on DB roundtrips.
+- *Producer* keyset-paginates `status='pending'` rows (`WHERE transfer_idc_file_id > $last … LIMIT 1000`) in short autocommit queries into a bounded buffered channel (`make(chan fileRow, CONCURRENCY*2)`). No 500k-row memory blow-up, the bounded channel provides backpressure, and — unlike a single server-side cursor held open for the whole transfer — it never pins the xmin horizon for hours (which would stall autovacuum on the heavily-updated `transfer_idc_file`).
+- *Consumers* (`CONCURRENCY` goroutines) pull rows, do the GCS work **with inline retry + exponential backoff**, and push only *terminal* result tuples to a separate results channel. They never touch the DB directly. Inline retry is load-bearing: the producer streams each pending row exactly once, so a worker must drive its file all the way to `completed`/`failed` itself — there is no second pass that would re-pick a row left at `pending`.
+- *Flusher* (one goroutine) drains the results channel and issues batched `UPDATE … FROM unnest(...)` writes every `FLUSH_EVERY=500` rows or `FLUSH_AFTER=2s` measured from the first buffered row, whichever first. One writer → no lock contention; consumers don't block on DB roundtrips. A scratch goroutine fan-in pattern is used to close `results` exactly when all consumers have returned, so the flusher's `for r := range results` exits cleanly.
 
-**Effective upload concurrency** — the consumers wrap the *synchronous* GCS client in `asyncio.to_thread`, so real parallelism is bounded by two things that must be sized to `CONCURRENCY` rather than left at their defaults: (1) the event loop's default `ThreadPoolExecutor` (default `min(32, cpu+4)`), installed explicitly via `loop.set_default_executor(ThreadPoolExecutor(max_workers=CONCURRENCY))`; and (2) the GCS client's HTTP connection pool (urllib3 default ~10), enlarged by mounting a sized `HTTPAdapter`. Without both, 200 consumer coroutines collapse onto ~10–32 real connections and throughput falls far below the ~1000 writes/sec budget. A native-async client (`gcloud-aio-storage`) would remove the thread-pool layer entirely and is the cleaner option if this becomes the bottleneck.
+**Effective upload concurrency** — Go's GCS client is natively concurrent (`storage.Writer` uses the standard `net/http` round-tripper), so there is no thread-pool layer to size like in Python. The one knob worth touching is `http.Transport.MaxIdleConnsPerHost`: the default is **2**, which would force the 200 consumer goroutines into constant TCP+TLS reconnects against `storage.googleapis.com`. The daemon builds the GCS client over a custom transport with `MaxIdleConnsPerHost = CONCURRENCY*2`, kept alive by `IdleConnTimeout=90s`. With that one change, the goroutines fan out to a real connection pool of the right size. If GCS HTTP throughput becomes the ceiling, the cleaner next step is switching the storage client to its gRPC transport (HTTP/2 multiplexing on a small number of streams) — at which point even the idle-pool tuning becomes unnecessary.
 
 **No in-flight `'uploading'` state** — workers transition `pending → completed/failed` directly. Writing `'uploading'` on claim would mean 500k extra per-row UPDATEs and defeat the batched flusher. Tradeoff: a crash loses any results buffered in the flusher (≤500 rows or ≤2s of work). On restart those files are still `'pending'` and re-upload — but the idempotency check sees the object already in GCS with a matching MD5 and skips the actual upload, so the cost is just an extra HEAD per affected row.
 
-**LISTEN/NOTIFY plus a reconciliation safety net** — the trigger fires on INSERT or re-queue, so the daemon wakes instantly. The listener runs on a dedicated `asyncpg.connect()` (not borrowed from the pool) so it can't be stolen for other work and a slow callback can't block the pool. But NOTIFY is *not durable*: any notification fired while the listener is disconnected is lost forever. So the listener auto-reconnects (re-`LISTEN` + re-scan on every (re)connect), and a periodic `reconcile_loop` re-runs the `('queued','in_progress')` recovery query every `RECONCILE_INTERVAL` seconds. That poll also rescues transfers stranded at `'in_progress'` when `process_transfer` throws mid-flight (which emits no NOTIFY). LISTEN is the fast path; the poll is what makes delivery reliable.
+**LISTEN/NOTIFY plus a reconciliation safety net** — the trigger fires on INSERT or re-queue, so the daemon wakes instantly. The listener runs on a dedicated `pgx.Connect()` (not borrowed from the `pgxpool.Pool`) so it can't be stolen for other work and a slow callback can't block the pool. pgx exposes NOTIFY natively via `conn.WaitForNotification(ctx)`, which is a blocking read that respects context cancellation. But NOTIFY is *not durable*: any notification fired while the listener is disconnected is lost forever. So the listener auto-reconnects (re-`LISTEN` + re-scan on every (re)connect), and a periodic reconcile goroutine re-runs the `('queued','in_progress')` recovery query every `RECONCILE_INTERVAL`. That poll also rescues transfers stranded at `'in_progress'` when `processTransfer` errors mid-flight (which emits no NOTIFY). LISTEN is the fast path; the poll is what makes delivery reliable.
 
-**Idempotent, integrity-checked file uploads** — before uploading, a single `bucket.get_blob()` (one HEAD, vs `exists()`+`reload()`'s two) fetches the object's metadata; if it is present and its MD5 matches the stored digest (`base64.b64decode(blob.md5_hash).hex()` vs `file.digest`), the file is recorded completed without re-uploading. `md5_hash` is `None` for composite objects, which is treated as "no match" so the file re-uploads. The upload itself passes `checksum="md5"` so GCS rejects a corrupted round trip server-side — important since these are archival medical images and we already hold the authoritative MD5.
+**Idempotent, integrity-checked file uploads** — before uploading, a single `ObjectHandle.Attrs(ctx)` call fetches the object's metadata; if it is present and `attrs.MD5` (raw 16-byte digest as returned by the Go SDK) matches the stored digest from `file.digest` (decoded from hex), the file is recorded completed without re-uploading. `attrs.MD5` is empty for composite objects, which is treated as "no match" so the file re-uploads. The upload itself sets `Writer.MD5 = expectedMD5` so GCS rejects a corrupted round trip server-side — important since these are archival medical images and we already hold the authoritative MD5.
 
 **Crash recovery is implicit** — on startup (and on every listener reconnect, and every `RECONCILE_INTERVAL` via the reconcile loop), any `dataset_release_transfer` in `('queued','in_progress')` is re-enqueued. Because the claim CAS accepts both, a resumed transfer just re-runs the producer over remaining `'pending'` rows. Completed files stay completed; previously-failed files are reset by the claim transaction so a re-queue retries them. The `inflight` set keeps these overlapping re-enqueues from stacking duplicate runs of the same transfer.
 
@@ -264,426 +264,762 @@ SELECT status, COUNT(*) FROM transfer_idc_file
 
 ## Code Skeleton
 
-```python
-# daemon.py
-import asyncio
-import base64
-import logging
-import os
-import signal
-import time
-from concurrent.futures import ThreadPoolExecutor
+The daemon is a single Go binary built as `main` package in five files under `go-test/`. Each file owns a tight concern (entrypoint, top-level wiring, DB-side LISTEN/reconcile, GCS plumbing, per-transfer pipeline) so the call graph stays scannable.
 
-import asyncpg
-import requests
-from google.cloud import storage
+### `main.go` — entrypoint + signal handling
 
-DSN          = os.environ["TRANSFER_DAEMON_DSN"]
-CONCURRENCY  = 200          # per-transfer worker count
-MAX_ATTEMPTS = 3            # inline upload retries per file before giving up
-BACKOFF_BASE = 0.5          # seconds; exponential backoff between retries
-FLUSH_EVERY  = 500          # batch this many updates before flushing
-FLUSH_AFTER  = 2.0          # ...or this many seconds after the first buffered row, whichever first
-POOL_MIN     = 2
-POOL_MAX     = 6
-TRANSFER_PARALLELISM = 1    # at most one transfer in flight at a time
-RECONCILE_INTERVAL   = 300  # safety-net re-scan for missed NOTIFYs (seconds)
-NOTIFY_CHANNEL = "idc_transfer_channel"
+```go
+package main
 
-log = logging.getLogger("idc_transfer_daemon")
-_FLUSHER_DONE = object()  # sentinel for shutting down the flusher
+import (
+    "context"
+    "errors"
+    "log/slog"
+    "os"
+    "os/signal"
+    "syscall"
+)
 
+func main() {
+    logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+    slog.SetDefault(logger)
 
-def make_gcs_client() -> storage.Client:
-    # Size the HTTP connection pool to CONCURRENCY; the urllib3 default (~10)
-    # would serialise the workers no matter how many coroutines we run.
-    client = storage.Client()
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=CONCURRENCY, pool_maxsize=CONCURRENCY
-    )
-    client._http.mount("https://", adapter)  # _http is the AuthorizedSession (a requests.Session)
-    client._http.mount("http://", adapter)
-    return client
+    ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+    defer stop()
 
+    if err := run(ctx, logger); err != nil && !errors.Is(err, context.Canceled) {
+        logger.Error("daemon exited with error", "err", err)
+        os.Exit(1)
+    }
+}
+```
 
-def parse_gs_url(url: str) -> tuple[str, str]:
-    # "gs://bucket/path/to/object" → ("bucket", "path/to/object")
-    if not url.startswith("gs://"):
-        raise ValueError(f"not a gs:// URL: {url!r}")
-    bucket, _, name = url[5:].partition("/")
-    if not bucket or not name:
-        raise ValueError(f"malformed gs:// URL: {url!r}")
-    return bucket, name
+### `daemon.go` — config, pool wiring, dispatcher
 
+```go
+package main
 
-def gcs_md5_hex(blob: storage.Blob) -> str | None:
-    # GCS exposes md5 as base64; convert to hex to compare with file.digest.
-    # Composite objects have no md5 — return None so the caller re-uploads.
-    if blob.md5_hash is None:
-        return None
-    return base64.b64decode(blob.md5_hash).hex()
+import (
+    "context"
+    "errors"
+    "log/slog"
+    "os"
+    "sync"
+    "time"
 
+    "github.com/jackc/pgx/v5/pgxpool"
+)
 
-async def claim_transfer(pool, transfer_id):
-    """Atomic claim. Returns True iff this daemon now owns the transfer."""
-    async with pool.acquire() as conn, conn.transaction():
-        row = await conn.fetchrow(
-            """
+const (
+    Concurrency         = 200                    // per-transfer worker count
+    MaxAttempts         = 3                      // inline upload retries per file
+    BackoffBase         = 500 * time.Millisecond // exponential backoff base
+    FlushEvery          = 500                    // flush after this many rows
+    FlushAfter          = 2 * time.Second        // ...or this long after the first buffered row
+    PoolMin             = int32(2)
+    PoolMax             = int32(6)
+    TransferParallelism = 1                      // at most one transfer in flight
+    ReconcileInterval   = 5 * time.Minute        // safety-net rescan for missed NOTIFYs
+    NotifyChannel       = "idc_transfer_channel"
+)
+
+func run(ctx context.Context, log *slog.Logger) error {
+    dsn := os.Getenv("TRANSFER_DAEMON_DSN")
+    if dsn == "" {
+        return errors.New("TRANSFER_DAEMON_DSN must be set")
+    }
+
+    cfg, err := pgxpool.ParseConfig(dsn)
+    if err != nil {
+        return err
+    }
+    cfg.MinConns = PoolMin
+    cfg.MaxConns = PoolMax
+
+    pool, err := pgxpool.NewWithConfig(ctx, cfg)
+    if err != nil {
+        return err
+    }
+    defer pool.Close()
+
+    gcs, err := newGCSClient(ctx)
+    if err != nil {
+        return err
+    }
+    defer gcs.Close()
+
+    pending := make(chan int64, 1024)
+    sem := make(chan struct{}, TransferParallelism)
+
+    var infra sync.WaitGroup
+    infra.Add(2)
+    go func() { defer infra.Done(); runListener(ctx, dsn, pending, log) }()
+    go func() { defer infra.Done(); runReconciler(ctx, pool, pending, log) }()
+
+    var inflight sync.Map
+    var transfers sync.WaitGroup
+
+dispatch:
+    for {
+        select {
+        case <-ctx.Done():
+            break dispatch
+        case tid := <-pending:
+            if _, dup := inflight.LoadOrStore(tid, struct{}{}); dup {
+                continue
+            }
+            transfers.Add(1)
+            go func(id int64) {
+                defer transfers.Done()
+                defer inflight.Delete(id)
+
+                select {
+                case sem <- struct{}{}:
+                case <-ctx.Done():
+                    return
+                }
+                defer func() { <-sem }()
+
+                if err := processTransfer(ctx, pool, gcs, id, log); err != nil {
+                    log.Error("transfer crashed", "transfer_id", id, "err", err)
+                }
+            }(tid)
+        }
+    }
+
+    log.Info("shutdown requested; draining in-flight transfer(s)")
+    infra.Wait()
+    transfers.Wait()
+    return nil
+}
+```
+
+### `db.go` — LISTEN connection + reconcile loop
+
+```go
+package main
+
+import (
+    "context"
+    "log/slog"
+    "strconv"
+    "time"
+
+    "github.com/jackc/pgx/v5"
+    "github.com/jackc/pgx/v5/pgxpool"
+)
+
+const reconcileSQL = `
+SELECT dataset_release_transfer_id
+  FROM dataset_release_transfer
+ WHERE transfer_status IN ('queued', 'in_progress')
+ ORDER BY dataset_release_transfer_id
+`
+
+// queryer is satisfied by both *pgxpool.Pool and *pgx.Conn.
+type queryer interface {
+    Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+func enqueueStale(ctx context.Context, q queryer, pending chan<- int64) error {
+    rows, err := q.Query(ctx, reconcileSQL)
+    if err != nil {
+        return err
+    }
+    defer rows.Close()
+    for rows.Next() {
+        var id int64
+        if err := rows.Scan(&id); err != nil {
+            return err
+        }
+        select {
+        case pending <- id:
+        case <-ctx.Done():
+            return ctx.Err()
+        }
+    }
+    return rows.Err()
+}
+
+func runListener(ctx context.Context, dsn string, pending chan<- int64, log *slog.Logger) {
+    for ctx.Err() == nil {
+        err := listenOnce(ctx, dsn, pending, log)
+        if err != nil && ctx.Err() == nil {
+            log.Warn("listener connection lost; retrying in 5s", "err", err)
+            select {
+            case <-time.After(5 * time.Second):
+            case <-ctx.Done():
+                return
+            }
+        }
+    }
+}
+
+func listenOnce(ctx context.Context, dsn string, pending chan<- int64, log *slog.Logger) error {
+    conn, err := pgx.Connect(ctx, dsn)
+    if err != nil {
+        return err
+    }
+    defer conn.Close(context.Background())
+
+    if _, err := conn.Exec(ctx, "LISTEN "+NotifyChannel); err != nil {
+        return err
+    }
+    log.Info("listening", "channel", NotifyChannel)
+
+    // NOTIFY is not durable: rescan on every (re)connect.
+    if err := enqueueStale(ctx, conn, pending); err != nil {
+        return err
+    }
+
+    for {
+        n, err := conn.WaitForNotification(ctx)
+        if err != nil {
+            return err
+        }
+        tid, perr := strconv.ParseInt(n.Payload, 10, 64)
+        if perr != nil {
+            log.Warn("malformed NOTIFY payload", "payload", n.Payload)
+            continue
+        }
+        select {
+        case pending <- tid:
+        case <-ctx.Done():
+            return ctx.Err()
+        }
+    }
+}
+
+func runReconciler(ctx context.Context, pool *pgxpool.Pool, pending chan<- int64, log *slog.Logger) {
+    t := time.NewTicker(ReconcileInterval)
+    defer t.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-t.C:
+            if err := enqueueStale(ctx, pool, pending); err != nil && ctx.Err() == nil {
+                log.Warn("reconcile rescan failed", "err", err)
+            }
+        }
+    }
+}
+```
+
+### `gcs.go` — client + URL parsing + idempotent upload
+
+```go
+package main
+
+import (
+    "bytes"
+    "context"
+    "crypto/md5"
+    "encoding/hex"
+    "errors"
+    "fmt"
+    "io"
+    "net/http"
+    "os"
+    "strings"
+    "time"
+
+    "cloud.google.com/go/storage"
+    "google.golang.org/api/option"
+    htransport "google.golang.org/api/transport/http"
+)
+
+func newGCSClient(ctx context.Context) (*storage.Client, error) {
+    var opts []option.ClientOption
+    if kf := os.Getenv("GCS_KEY_FILE"); kf != "" {
+        opts = append(opts, option.WithCredentialsFile(kf))
+    } else if _, err := os.Stat("sa-key.json"); err == nil {
+        opts = append(opts, option.WithCredentialsFile("sa-key.json"))
+    } // else: fall back to ADC (GOOGLE_APPLICATION_CREDENTIALS / metadata)
+
+    // Default http.Transport has MaxIdleConnsPerHost=2; with Concurrency
+    // workers in flight that would force constant TCP+TLS reconnects.
+    base := &http.Transport{
+        MaxIdleConns:        Concurrency * 2,
+        MaxIdleConnsPerHost: Concurrency * 2,
+        IdleConnTimeout:     90 * time.Second,
+    }
+    rt, err := htransport.NewTransport(ctx, base, opts...)
+    if err != nil {
+        return nil, fmt.Errorf("build gcs transport: %w", err)
+    }
+    return storage.NewClient(ctx, option.WithHTTPClient(&http.Client{Transport: rt}))
+}
+
+func parseGSURL(url string) (bucket, name string, err error) {
+    if !strings.HasPrefix(url, "gs://") {
+        return "", "", fmt.Errorf("not a gs:// URL: %q", url)
+    }
+    rest := url[5:]
+    i := strings.IndexByte(rest, '/')
+    if i < 1 || i == len(rest)-1 {
+        return "", "", fmt.Errorf("malformed gs:// URL: %q", url)
+    }
+    return rest[:i], rest[i+1:], nil
+}
+
+// uploadFile uploads localPath to gs://bucket/object, verifying GCS-side
+// against expectedMD5 (raw 16-byte digest). Returns nil if a matching object
+// already exists. The caller is responsible for retries.
+func uploadFile(ctx context.Context, gcs *storage.Client, bucket, object, localPath string, expectedMD5 []byte) error {
+    obj := gcs.Bucket(bucket).Object(object)
+
+    // Single HEAD: if it exists with the right MD5, no-op.
+    if attrs, err := obj.Attrs(ctx); err == nil {
+        if len(attrs.MD5) > 0 && bytes.Equal(attrs.MD5, expectedMD5) {
+            return nil
+        }
+    } else if !errors.Is(err, storage.ErrObjectNotExist) {
+        return fmt.Errorf("attrs: %w", err)
+    }
+
+    f, err := os.Open(localPath)
+    if err != nil {
+        return fmt.Errorf("open local: %w", err)
+    }
+    defer f.Close()
+
+    w := obj.NewWriter(ctx)
+    w.MD5 = expectedMD5 // GCS rejects the upload server-side on mismatch.
+    if _, err := io.Copy(w, f); err != nil {
+        _ = w.Close()
+        return fmt.Errorf("copy: %w", err)
+    }
+    if err := w.Close(); err != nil {
+        return fmt.Errorf("finalize: %w", err)
+    }
+    return nil
+}
+
+// md5OfFile streams a file through md5 and returns the raw 16-byte digest.
+// Used for the manifest (where we don't already hold the digest in the DB).
+func md5OfFile(path string) ([]byte, error) {
+    f, err := os.Open(path)
+    if err != nil {
+        return nil, err
+    }
+    defer f.Close()
+    h := md5.New()
+    if _, err := io.Copy(h, f); err != nil {
+        return nil, err
+    }
+    return h.Sum(nil), nil
+}
+
+func decodeMD5Hex(s string) ([]byte, error) {
+    b, err := hex.DecodeString(s)
+    if err != nil {
+        return nil, err
+    }
+    return b, nil
+}
+```
+
+### `transfer.go` — per-transfer pipeline
+
+```go
+package main
+
+import (
+    "context"
+    "errors"
+    "fmt"
+    "log/slog"
+    "strings"
+    "time"
+
+    "cloud.google.com/go/storage"
+    "github.com/jackc/pgx/v5"
+    "github.com/jackc/pgx/v5/pgxpool"
+    "golang.org/x/sync/errgroup"
+)
+
+type fileRow struct {
+    ID        int64  // transfer_idc_file_id
+    FileID    int64
+    GCSURL    string
+    LocalPath string
+    MD5Hex    string
+    Attempts  int32
+}
+
+type fileResult struct {
+    ID       int64
+    Status   string // "completed" | "failed"
+    Error    string // empty when Status == "completed"
+    Attempts int32
+}
+
+func processTransfer(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Client, transferID int64, log *slog.Logger) error {
+    claimed, err := claimTransfer(ctx, pool, transferID)
+    if err != nil {
+        return fmt.Errorf("claim: %w", err)
+    }
+    if !claimed {
+        log.Info("transfer skipped (not claimable)", "transfer_id", transferID)
+        return nil
+    }
+    log.Info("transfer starting", "transfer_id", transferID)
+
+    queue := make(chan fileRow, Concurrency*2)
+    results := make(chan fileResult, FlushEvery*4)
+
+    g, gctx := errgroup.WithContext(ctx)
+
+    g.Go(func() error {
+        defer close(queue)
+        return fileProducer(gctx, pool, transferID, queue)
+    })
+
+    g.Go(func() error {
+        cg, cgctx := errgroup.WithContext(gctx)
+        for i := 0; i < Concurrency; i++ {
+            cg.Go(func() error {
+                return fileConsumer(cgctx, gcs, transferID, queue, results, log)
+            })
+        }
+        err := cg.Wait()
+        close(results) // exactly once, after all consumers have returned
+        return err
+    })
+
+    g.Go(func() error { return flusherLoop(gctx, pool, results) })
+
+    if err := g.Wait(); err != nil {
+        return fmt.Errorf("pipeline: %w", err)
+    }
+
+    var ok, notOk int64
+    if err := pool.QueryRow(ctx, `
+        SELECT COUNT(*) FILTER (WHERE status = 'completed'),
+               COUNT(*) FILTER (WHERE status <> 'completed')
+          FROM transfer_idc_file
+         WHERE dataset_release_transfer_id = $1
+    `, transferID).Scan(&ok, &notOk); err != nil {
+        return fmt.Errorf("tally: %w", err)
+    }
+    log.Info("transfer file results", "transfer_id", transferID, "completed", ok, "incomplete", notOk)
+
+    if notOk > 0 || ok == 0 {
+        // Any non-completed row blocks submission; ok==0 catches the empty case.
+        if _, err := pool.Exec(ctx, `
             UPDATE dataset_release_transfer
-               SET transfer_status = 'in_progress', when_updated = now(),
-                   who_updated = 'idc_transfer_daemon'
-             WHERE dataset_release_transfer_id = $1
-               AND transfer_status IN ('queued', 'in_progress')
-            RETURNING dataset_release_transfer_id
-            """,
-            transfer_id,
-        )
-        if row is None:
-            return False
+               SET transfer_status='failed', when_updated=now(),
+                   who_updated='idc_transfer_daemon'
+             WHERE dataset_release_transfer_id=$1
+        `, transferID); err != nil {
+            return fmt.Errorf("mark failed: %w", err)
+        }
+        log.Warn("transfer marked failed", "transfer_id", transferID)
+        return nil
+    }
 
-        # Fan-out into transfer_idc_file happened externally before this transfer
-        # was queued; the daemon does not insert into transfer_idc_file.
+    manifestURL, err := uploadManifest(ctx, pool, gcs, transferID)
+    if err != nil {
+        return fmt.Errorf("upload manifest: %w", err)
+    }
 
-        # On re-queue, give previously failed files another pass.
-        await conn.execute(
-            """
-            UPDATE transfer_idc_file
-               SET status='pending', attempts=0, error=NULL, updated_at=now()
-             WHERE dataset_release_transfer_id = $1 AND status = 'failed'
-            """,
-            transfer_id,
-        )
-    return True
+    tx, err := pool.Begin(ctx)
+    if err != nil {
+        return fmt.Errorf("begin success tx: %w", err)
+    }
+    defer tx.Rollback(ctx)
+    if _, err := tx.Exec(ctx,
+        "UPDATE transfer_idc SET gcs_url=$1 WHERE dataset_release_transfer_id=$2",
+        manifestURL, transferID); err != nil {
+        return fmt.Errorf("set transfer_idc gcs_url: %w", err)
+    }
+    if _, err := tx.Exec(ctx, `
+        UPDATE dataset_release_transfer
+           SET transfer_status='success', when_updated=now(),
+               who_updated='idc_transfer_daemon'
+         WHERE dataset_release_transfer_id=$1
+    `, transferID); err != nil {
+        return fmt.Errorf("mark success: %w", err)
+    }
+    if err := tx.Commit(ctx); err != nil {
+        return fmt.Errorf("commit success: %w", err)
+    }
+    log.Info("transfer succeeded", "transfer_id", transferID, "manifest", manifestURL)
+    return nil
+}
 
+func claimTransfer(ctx context.Context, pool *pgxpool.Pool, transferID int64) (bool, error) {
+    tx, err := pool.Begin(ctx)
+    if err != nil {
+        return false, err
+    }
+    defer tx.Rollback(ctx)
 
-async def file_producer(pool, transfer_id, queue):
-    # Keyset pagination in short autocommit queries — no hours-long open
-    # transaction pinning the xmin horizon while 500k rows churn.
-    # local_path and md5 are re-joined here rather than stored on transfer_idc_file.
-    # file_location has exactly one row per file_id (a unique index is planned).
-    last_id = 0
-    while True:
-        rows = await pool.fetch(
-            """
-            SELECT tif.transfer_idc_file_id              AS id,
-                   tif.file_id                           AS file_id,
-                   tif.gcs_url                           AS gcs_url,
-                   fsr.root_path || '/' || fl.rel_path   AS local_path,
-                   f.digest                              AS md5,
-                   tif.attempts                          AS attempts
+    var got int64
+    err = tx.QueryRow(ctx, `
+        UPDATE dataset_release_transfer
+           SET transfer_status = 'in_progress', when_updated = now(),
+               who_updated = 'idc_transfer_daemon'
+         WHERE dataset_release_transfer_id = $1
+           AND transfer_status IN ('queued', 'in_progress')
+        RETURNING dataset_release_transfer_id
+    `, transferID).Scan(&got)
+    if errors.Is(err, pgx.ErrNoRows) {
+        return false, nil
+    }
+    if err != nil {
+        return false, err
+    }
+
+    // Fan-out into transfer_idc_file already happened externally; on re-queue,
+    // give previously failed files another pass.
+    if _, err := tx.Exec(ctx, `
+        UPDATE transfer_idc_file
+           SET status='pending', attempts=0, error=NULL, updated_at=now()
+         WHERE dataset_release_transfer_id = $1 AND status = 'failed'
+    `, transferID); err != nil {
+        return false, err
+    }
+    return true, tx.Commit(ctx)
+}
+
+func fileProducer(ctx context.Context, pool *pgxpool.Pool, transferID int64, queue chan<- fileRow) error {
+    // Keyset pagination in short autocommit queries — no hours-long open
+    // transaction pinning the xmin horizon while 500k rows churn.
+    var lastID int64
+    for {
+        rows, err := pool.Query(ctx, `
+            SELECT tif.transfer_idc_file_id,
+                   tif.file_id,
+                   tif.gcs_url,
+                   fsr.root_path || '/' || fl.rel_path,
+                   f.digest,
+                   tif.attempts
               FROM transfer_idc_file  tif
-              JOIN file               f   ON f.file_id   = tif.file_id
-              JOIN file_location      fl  ON fl.file_id  = tif.file_id
+              JOIN file               f   ON f.file_id  = tif.file_id
+              JOIN file_location      fl  ON fl.file_id = tif.file_id
               JOIN file_storage_root  fsr ON fsr.file_storage_root_id = fl.file_storage_root_id
              WHERE tif.dataset_release_transfer_id = $1
                AND tif.status = 'pending'
                AND tif.transfer_idc_file_id > $2
              ORDER BY tif.transfer_idc_file_id
              LIMIT 1000
-            """,
-            transfer_id, last_id,
-        )
-        if not rows:
-            break
-        for row in rows:
-            await queue.put(row)
-        last_id = rows[-1]["id"]
-    for _ in range(CONCURRENCY):
-        await queue.put(None)  # poison pills to shut down consumers
+        `, transferID, lastID)
+        if err != nil {
+            return err
+        }
+        var batch []fileRow
+        for rows.Next() {
+            var r fileRow
+            if err := rows.Scan(&r.ID, &r.FileID, &r.GCSURL, &r.LocalPath, &r.MD5Hex, &r.Attempts); err != nil {
+                rows.Close()
+                return err
+            }
+            batch = append(batch, r)
+        }
+        if err := rows.Err(); err != nil {
+            rows.Close()
+            return err
+        }
+        rows.Close()
+        if len(batch) == 0 {
+            return nil
+        }
+        for _, r := range batch {
+            select {
+            case queue <- r:
+            case <-ctx.Done():
+                return ctx.Err()
+            }
+        }
+        lastID = batch[len(batch)-1].ID
+    }
+}
 
+func fileConsumer(ctx context.Context, gcs *storage.Client, transferID int64, queue <-chan fileRow, results chan<- fileResult, log *slog.Logger) error {
+    for {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case row, ok := <-queue:
+            if !ok {
+                return nil
+            }
+            res := uploadOne(ctx, gcs, transferID, row, log)
+            select {
+            case results <- res:
+            case <-ctx.Done():
+                return ctx.Err()
+            }
+        }
+    }
+}
 
-async def upload_one(transfer_id, gcs_client, row):
-    """Upload one file with inline retry+backoff. Returns a *terminal* result tuple.
+// uploadOne drives one file all the way to a terminal result. The producer
+// streams each row exactly once, so there is no second pass to clean up
+// anything left at 'pending' — inline retry is load-bearing.
+func uploadOne(ctx context.Context, gcs *storage.Client, transferID int64, row fileRow, log *slog.Logger) fileResult {
+    expectedMD5, err := decodeMD5Hex(row.MD5Hex)
+    if err != nil {
+        return fileResult{ID: row.ID, Status: "failed",
+            Error: fmt.Sprintf("decode md5 digest: %v", err), Attempts: row.Attempts + 1}
+    }
+    bucket, object, err := parseGSURL(row.GCSURL)
+    if err != nil {
+        return fileResult{ID: row.ID, Status: "failed", Error: err.Error(), Attempts: row.Attempts + 1}
+    }
 
-    The producer streams each row exactly once, so a worker must drive its file
-    all the way to 'completed' or 'failed' here — there is no second pass.
-    The destination is whatever URL the external fan-out wrote into row['gcs_url']."""
-    bucket_name, object_name = parse_gs_url(row["gcs_url"])
-    bucket   = gcs_client.bucket(bucket_name)
-    attempts = row["attempts"]
-    last_err = None
+    attempts := row.Attempts
+    var lastErr error
+    for attempt := 1; attempt <= MaxAttempts; attempt++ {
+        attempts++
+        if err := uploadFile(ctx, gcs, bucket, object, row.LocalPath, expectedMD5); err == nil {
+            return fileResult{ID: row.ID, Status: "completed", Attempts: attempts}
+        } else {
+            lastErr = err
+            log.Warn("upload failed", "transfer_id", transferID, "file_id", row.FileID,
+                "attempt", attempts, "err", err)
+            if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+                break
+            }
+            if attempt < MaxAttempts {
+                select {
+                case <-time.After(BackoffBase * (1 << (attempt - 1))):
+                case <-ctx.Done():
+                    return fileResult{ID: row.ID, Status: "failed",
+                        Error: ctx.Err().Error(), Attempts: attempts}
+                }
+            }
+        }
+    }
+    return fileResult{ID: row.ID, Status: "failed", Error: lastErr.Error(), Attempts: attempts}
+}
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        attempts += 1
-        try:
-            existing = await asyncio.to_thread(bucket.get_blob, object_name)  # one HEAD
-            if existing is not None and gcs_md5_hex(existing) == row["md5"]:
-                return (row["id"], "completed", None, attempts)
+// flusherLoop is the single writer; flushes on size or FLUSH_AFTER since the
+// first buffered row, whichever first. Crash before flush loses up to
+// FlushEvery rows / FlushAfter of work — those files stay 'pending' and
+// re-upload on restart, where the HEAD-and-verify idempotency turns them
+// into a no-op.
+func flusherLoop(ctx context.Context, pool *pgxpool.Pool, results <-chan fileResult) error {
+    var buf []fileResult
+    var timer *time.Timer
+    var timerC <-chan time.Time
 
-            blob = bucket.blob(object_name)
-            await asyncio.to_thread(
-                blob.upload_from_filename, row["local_path"], checksum="md5"
-            )  # checksum="md5" → GCS rejects a corrupted round trip
-            return (row["id"], "completed", None, attempts)
-        except Exception as exc:
-            last_err = exc
-            log.warning("upload failed transfer=%s file_id=%s attempt=%s err=%s",
-                        transfer_id, row["file_id"], attempts, exc)
-            if attempt < MAX_ATTEMPTS:
-                await asyncio.sleep(BACKOFF_BASE * 2 ** (attempt - 1))
+    flush := func() error {
+        if len(buf) == 0 {
+            return nil
+        }
+        if err := flushBatch(ctx, pool, buf); err != nil {
+            return err
+        }
+        buf = buf[:0]
+        if timer != nil {
+            timer.Stop()
+            timer = nil
+            timerC = nil
+        }
+        return nil
+    }
 
-    return (row["id"], "failed", str(last_err), attempts)
+    for {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case r, ok := <-results:
+            if !ok {
+                return flush()
+            }
+            if len(buf) == 0 {
+                timer = time.NewTimer(FlushAfter)
+                timerC = timer.C
+            }
+            buf = append(buf, r)
+            if len(buf) >= FlushEvery {
+                if err := flush(); err != nil {
+                    return err
+                }
+            }
+        case <-timerC:
+            if err := flush(); err != nil {
+                return err
+            }
+        }
+    }
+}
 
-
-async def file_consumer(transfer_id, gcs_client, queue, results):
-    while True:
-        row = await queue.get()
-        if row is None:
-            return
-        await results.put(await upload_one(transfer_id, gcs_client, row))
-
-
-async def flusher(pool, results):
-    """Single writer. Flushes on size OR FLUSH_AFTER since the first buffered row."""
-    buffer = []
-    first_at = None
-    while True:
-        timeout = None if first_at is None else max(0.0, FLUSH_AFTER - (time.monotonic() - first_at))
-        try:
-            item = await asyncio.wait_for(results.get(), timeout=timeout)
-        except asyncio.TimeoutError:
-            item = None  # time-based flush trigger
-
-        if item is _FLUSHER_DONE:
-            break
-        if item is not None:
-            if not buffer:
-                first_at = time.monotonic()
-            buffer.append(item)
-
-        time_up = first_at is not None and (time.monotonic() - first_at) >= FLUSH_AFTER
-        if buffer and (len(buffer) >= FLUSH_EVERY or item is None or time_up):
-            await flush(pool, buffer)
-            buffer.clear()
-            first_at = None
-
-    if buffer:
-        await flush(pool, buffer)
-
-
-async def flush(pool, buffer):
-    # gcs_url is owned by the external fan-out and never written here.
-    await pool.execute(
-        """
+// flushBatch writes a batch of terminal results via UPDATE FROM unnest(...).
+// Error is encoded as text[] and NULLed in SQL for completed rows, dodging
+// the pgtype.Array[pgtype.Text] boilerplate for nullable text arrays.
+// gcs_url is owned by the external fan-out and never written here.
+func flushBatch(ctx context.Context, pool *pgxpool.Pool, buf []fileResult) error {
+    ids := make([]int64, len(buf))
+    statuses := make([]string, len(buf))
+    errs := make([]string, len(buf))
+    attempts := make([]int32, len(buf))
+    for i, r := range buf {
+        ids[i] = r.ID
+        statuses[i] = r.Status
+        errs[i] = r.Error
+        attempts[i] = r.Attempts
+    }
+    _, err := pool.Exec(ctx, `
         UPDATE transfer_idc_file SET
             status     = u.status,
-            error      = u.error,
+            error      = CASE WHEN u.status = 'completed' THEN NULL ELSE u.error END,
             attempts   = u.attempts,
             updated_at = now()
-        FROM unnest($1::int[], $2::text[], $3::text[], $4::int[])
+          FROM unnest($1::bigint[], $2::text[], $3::text[], $4::int[])
             AS u(id, status, error, attempts)
-        WHERE transfer_idc_file.transfer_idc_file_id = u.id
-        """,
-        [r[0] for r in buffer],
-        [r[1] for r in buffer],
-        [r[2] for r in buffer],
-        [r[3] for r in buffer],
-    )
+         WHERE transfer_idc_file.transfer_idc_file_id = u.id
+    `, ids, statuses, errs, attempts)
+    return err
+}
 
-
-async def upload_manifest(pool, gcs_client, transfer_id):
-    """Upload the externally-prepared manifest from Posda to GCS.
-
-    The manifest is created upstream and registered as a Posda file referenced
-    by transfer_idc.dataset_manifest_file_id; the daemon does not generate it.
-    Destination is '<base_path>/manifest.csv', where <base_path> is recovered
-    by stripping the trailing /<md5> from any transfer_idc_file row's gcs_url.
-    Returns the manifest's gs:// URL."""
-    manifest = await pool.fetchrow(
-        """
-        SELECT fsr.root_path || '/' || fl.rel_path AS local_path
+func uploadManifest(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Client, transferID int64) (string, error) {
+    var manifestPath string
+    err := pool.QueryRow(ctx, `
+        SELECT fsr.root_path || '/' || fl.rel_path
           FROM transfer_idc       ti
           JOIN file_location      fl  ON fl.file_id = ti.dataset_manifest_file_id
           JOIN file_storage_root  fsr ON fsr.file_storage_root_id = fl.file_storage_root_id
          WHERE ti.dataset_release_transfer_id = $1
-        """,
-        transfer_id,
-    )
-    if manifest is None:
-        raise RuntimeError(
-            f"transfer={transfer_id}: transfer_idc.dataset_manifest_file_id missing "
-            "or its file has no location — external setup did not run"
-        )
+    `, transferID).Scan(&manifestPath)
+    if errors.Is(err, pgx.ErrNoRows) {
+        return "", fmt.Errorf("transfer=%d: transfer_idc.dataset_manifest_file_id missing "+
+            "or its file has no location — external setup did not run", transferID)
+    }
+    if err != nil {
+        return "", err
+    }
 
-    sample = await pool.fetchval(
-        "SELECT gcs_url FROM transfer_idc_file "
-        "WHERE dataset_release_transfer_id = $1 LIMIT 1",
-        transfer_id,
-    )
-    base_path    = sample.rsplit("/", 1)[0]  # strip trailing /<md5>
-    manifest_url = f"{base_path}/manifest.csv"
-
-    bucket_name, object_name = parse_gs_url(manifest_url)
-    blob = gcs_client.bucket(bucket_name).blob(object_name)
-    await asyncio.to_thread(
-        blob.upload_from_filename,
-        manifest["local_path"],
-        checksum="md5",
-    )
-    return manifest_url
-
-
-async def process_transfer(pool, gcs_client, transfer_id):
-    if not await claim_transfer(pool, transfer_id):
-        log.info("transfer=%s skipped (not claimable)", transfer_id)
-        return
-
-    log.info("transfer=%s starting", transfer_id)
-
-    queue   = asyncio.Queue(maxsize=CONCURRENCY * 2)
-    results = asyncio.Queue(maxsize=FLUSH_EVERY * 4)  # bounded: backpressure if the DB stalls
-
-    flusher_task = asyncio.create_task(flusher(pool, results))
-    consumers = [
-        asyncio.create_task(file_consumer(transfer_id, gcs_client, queue, results))
-        for _ in range(CONCURRENCY)
-    ]
-    await file_producer(pool, transfer_id, queue)
-    await asyncio.gather(*consumers)
-    await results.put(_FLUSHER_DONE)
-    await flusher_task
-
-    counts = await pool.fetchrow(
-        """
-        SELECT COUNT(*) FILTER (WHERE status = 'completed')  AS ok,
-               COUNT(*) FILTER (WHERE status <> 'completed') AS not_ok
-          FROM transfer_idc_file
+    var sample string
+    if err := pool.QueryRow(ctx, `
+        SELECT gcs_url FROM transfer_idc_file
          WHERE dataset_release_transfer_id = $1
-        """,
-        transfer_id,
-    )
-    log.info("transfer=%s files completed=%s incomplete=%s",
-             transfer_id, counts["ok"], counts["not_ok"])
+         LIMIT 1
+    `, transferID).Scan(&sample); err != nil {
+        return "", fmt.Errorf("recover base_path: %w", err)
+    }
+    slash := strings.LastIndexByte(sample, '/')
+    if slash < 0 {
+        return "", fmt.Errorf("malformed sample gcs_url %q", sample)
+    }
+    manifestURL := sample[:slash] + "/manifest.csv"
 
-    if counts["not_ok"] > 0 or counts["ok"] == 0:
-        # Any non-'completed' row blocks submission. ok==0 catches the empty case
-        # (external fan-out didn't run, or recordset was empty) — refuse to mark success.
-        await pool.execute(
-            "UPDATE dataset_release_transfer SET transfer_status='failed', "
-            "when_updated=now(), who_updated='idc_transfer_daemon' "
-            "WHERE dataset_release_transfer_id=$1",
-            transfer_id,
-        )
-        log.warning("transfer=%s marked failed", transfer_id)
-        return
-
-    manifest_url = await upload_manifest(pool, gcs_client, transfer_id)
-    async with pool.acquire() as conn, conn.transaction():
-        await conn.execute(
-            "UPDATE transfer_idc SET gcs_url=$1 WHERE dataset_release_transfer_id=$2",
-            manifest_url, transfer_id,
-        )
-        await conn.execute(
-            "UPDATE dataset_release_transfer SET transfer_status='success', "
-            "when_updated=now(), who_updated='idc_transfer_daemon' "
-            "WHERE dataset_release_transfer_id=$1",
-            transfer_id,
-        )
-    log.info("transfer=%s succeeded manifest=%s", transfer_id, manifest_url)
-
-
-async def recover_stale(db):
-    """Find every transfer that is queued or already in progress.
-    Accepts a pool or a connection (both expose .fetch)."""
-    rows = await db.fetch(
-        "SELECT dataset_release_transfer_id FROM dataset_release_transfer "
-        "WHERE transfer_status IN ('queued', 'in_progress') "
-        "ORDER BY dataset_release_transfer_id"
-    )
-    return [r["dataset_release_transfer_id"] for r in rows]
-
-
-async def listen_loop(pending, stop):
-    """Maintain a dedicated LISTEN connection, reconnecting on drop.
-    NOTIFY is not durable, so re-scan for stale transfers on every (re)connect."""
-    while not stop.is_set():
-        conn = None
-        try:
-            conn = await asyncpg.connect(DSN)
-            await conn.add_listener(
-                NOTIFY_CHANNEL,
-                lambda _c, _pid, _ch, payload: pending.put_nowait(int(payload)),
-            )
-            log.info("listening on %s", NOTIFY_CHANNEL)
-            for tid in await recover_stale(conn):
-                pending.put_nowait(tid)
-            while not stop.is_set() and not conn.is_closed():
-                await asyncio.sleep(1)
-        except Exception:
-            log.exception("listener connection lost; retrying in 5s")
-            await asyncio.sleep(5)
-        finally:
-            if conn is not None:
-                await conn.close()
-
-
-async def reconcile_loop(pool, pending, stop):
-    """Safety net for missed NOTIFYs and transfers stranded mid-flight."""
-    while not stop.is_set():
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=RECONCILE_INTERVAL)
-            return  # stop requested
-        except asyncio.TimeoutError:
-            pass
-        for tid in await recover_stale(pool):
-            pending.put_nowait(tid)
-
-
-async def daemon():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-
-    loop = asyncio.get_running_loop()
-    loop.set_default_executor(ThreadPoolExecutor(max_workers=CONCURRENCY))
-
-    pool = await asyncpg.create_pool(DSN, min_size=POOL_MIN, max_size=POOL_MAX)
-    gcs  = make_gcs_client()
-
-    pending      = asyncio.Queue()
-    transfer_sem = asyncio.Semaphore(TRANSFER_PARALLELISM)
-    inflight     = set()      # dedupe: recovery + NOTIFY + reconcile may all enqueue one id
-    stop         = asyncio.Event()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
-
-    listener   = asyncio.create_task(listen_loop(pending, stop))
-    reconciler = asyncio.create_task(reconcile_loop(pool, pending, stop))
-    tasks      = set()
-
-    async def run_one(transfer_id):
-        async with transfer_sem:
-            try:
-                await process_transfer(pool, gcs, transfer_id)
-            except Exception:
-                log.exception("transfer=%s crashed", transfer_id)
-            finally:
-                inflight.discard(transfer_id)
-
-    while not stop.is_set():
-        try:
-            transfer_id = await asyncio.wait_for(pending.get(), timeout=1.0)
-        except asyncio.TimeoutError:
-            continue
-        if transfer_id in inflight:
-            continue  # already running; claim CAS would no-op anyway
-        inflight.add(transfer_id)
-        t = asyncio.create_task(run_one(transfer_id))
-        tasks.add(t)
-        t.add_done_callback(tasks.discard)
-
-    log.info("shutdown requested; draining %d in-flight transfer(s)", len(tasks))
-    listener.cancel()
-    reconciler.cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    await pool.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(daemon())
+    bucket, object, err := parseGSURL(manifestURL)
+    if err != nil {
+        return "", err
+    }
+    digest, err := md5OfFile(manifestPath)
+    if err != nil {
+        return "", fmt.Errorf("compute manifest md5: %w", err)
+    }
+    if err := uploadFile(ctx, gcs, bucket, object, manifestPath, digest); err != nil {
+        return "", err
+    }
+    return manifestURL, nil
+}
 ```
 
 ---
@@ -696,7 +1032,7 @@ if __name__ == "__main__":
 
 ## Deployment
 
-Run the daemon as a long-lived process — a systemd service or Docker container with `restart: always` is sufficient. No separate worker fleet or message broker is needed at this scale.
+Build a single static binary (`go build -o idc-transfer-daemon ./...`) and run it as a long-lived process — a systemd service or Docker container with `restart: always` is sufficient. No separate worker fleet or message broker is needed at this scale.
 
 ```ini
 # /etc/systemd/system/idc-transfer-daemon.service
@@ -705,7 +1041,9 @@ Description=Posda IDC Transfer Daemon
 After=network.target postgresql.service
 
 [Service]
-ExecStart=/path/to/.venv/bin/python daemon.py
+ExecStart=/usr/local/bin/idc-transfer-daemon
+Environment=TRANSFER_DAEMON_DSN=postgres://...
+Environment=GCS_KEY_FILE=/etc/idc-transfer/sa-key.json
 Restart=always
 RestartSec=5
 
@@ -713,6 +1051,13 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-The daemon must run on a host that can read the file storage roots: `upload_from_filename` reads each file from its `local_path` (`root_path || '/' || rel_path`), so the storage volumes must be mounted locally (or via NFS) on the daemon host. On SIGTERM/SIGINT (e.g. `systemctl stop`) the daemon stops accepting new transfers and drains the in-flight one before exiting; anything cut short is recovered by idempotent re-upload on the next start.
+The daemon must run on a host that can read the file storage roots: each upload streams from its `local_path` (`root_path || '/' || rel_path`), so the storage volumes must be mounted locally (or via NFS) on the daemon host. On SIGTERM/SIGINT (e.g. `systemctl stop`) `signal.NotifyContext` cancels the root context: the daemon stops accepting new transfers, in-flight workers wind down on their next `<-ctx.Done()`, and the dispatcher waits for the in-flight transfer goroutines to drain before exiting. Anything cut short is recovered by idempotent re-upload on the next start.
 
-Dependencies beyond the standard library are `asyncpg`, `google-cloud-storage`, and `requests` (already pulled in by the storage client) — no broker or worker fleet. If GCS throughput becomes the ceiling, swapping the synchronous client for `gcloud-aio-storage` removes the thread-pool layer the consumers currently rely on.
+Module dependencies (Go modules, declared in `go.mod`):
+
+- `github.com/jackc/pgx/v5` and `github.com/jackc/pgx/v5/pgxpool` — Postgres driver with native `LISTEN/NOTIFY` (`Conn.WaitForNotification`) and a connection pool.
+- `cloud.google.com/go/storage` — official GCS client.
+- `google.golang.org/api/option` and `google.golang.org/api/transport/http` — to swap in a custom `http.Transport` with `MaxIdleConnsPerHost` sized to `CONCURRENCY`.
+- `golang.org/x/sync/errgroup` — for the producer/consumer/flusher fan-out where the first error tears the pipeline down.
+
+If GCS HTTP throughput becomes the ceiling, the cleaner next step is switching the storage client to its gRPC transport: HTTP/2 multiplexes many uploads over a small number of streams, and the `MaxIdleConnsPerHost` knob becomes irrelevant.
