@@ -18,16 +18,16 @@ import (
 // the UDP dial failed. A dial failure logs a warning to stderr and falls back
 // to stderr-only; the daemon does not fail to start on a misconfigured log
 // endpoint.
-func newLogger(gelfAddr, gelfTag string) (*slog.Logger, bool) {
+func newLogger(gelfAddr, gelfTag string) (*slog.Logger, bool, func()) {
 	stderr := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
 	if gelfAddr == "" {
-		return slog.New(stderr), false
+		return slog.New(stderr), false, func() {}
 	}
 	conn, err := net.Dial("udp", gelfAddr)
 	if err != nil {
 		slog.New(stderr).Warn("gelf: dial failed; logging to stderr only",
 			"addr", gelfAddr, "err", err)
-		return slog.New(stderr), false
+		return slog.New(stderr), false, func() {}
 	}
 	host, err := os.Hostname()
 	if err != nil || host == "" {
@@ -39,7 +39,7 @@ func newLogger(gelfAddr, gelfTag string) (*slog.Logger, bool) {
 		tag:    gelfTag,
 		minLvl: slog.LevelInfo,
 	}}
-	return slog.New(&fanoutHandler{handlers: []slog.Handler{stderr, gelf}}), true
+	return slog.New(&fanoutHandler{handlers: []slog.Handler{stderr, gelf}}), true, func() { conn.Close() }
 }
 
 // redactDSN returns a copy of dsn with the password masked. Handles both the
@@ -59,7 +59,7 @@ func redactDSN(dsn string) string {
 	return dsnPasswordKV.ReplaceAllString(dsn, "password=***")
 }
 
-var dsnPasswordKV = regexp.MustCompile(`(?i)password\s*=\s*\S+`)
+var dsnPasswordKV = regexp.MustCompile(`(?i)password\s*=\s*(?:'[^']*'|\S+)`)
 
 // warnMisspelledEnv looks for environment variables whose name contains
 // `token` but isn't `expected` or any of `siblings`, and logs each as a

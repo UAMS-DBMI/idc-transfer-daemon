@@ -19,7 +19,8 @@ func main() {
 		gelfTag = DefaultGelfTag
 	}
 
-	logger, gelfActive := newLogger(gelfAddr, gelfTag)
+	logger, gelfActive, closeLogger := newLogger(gelfAddr, gelfTag)
+	defer closeLogger()
 	slog.SetDefault(logger)
 
 	if dsn == "" {

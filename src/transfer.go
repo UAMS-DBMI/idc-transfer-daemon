@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -261,8 +262,9 @@ func uploadOne(ctx context.Context, gcs *storage.Client, transferID int64, row f
 			break
 		}
 		if attempt < MaxAttempts {
+			jitter := time.Duration(rand.Int63n(int64(BackoffBase)))
 			select {
-			case <-time.After(BackoffBase * (1 << (attempt - 1))):
+			case <-time.After(BackoffBase*(1<<(attempt-1)) + jitter):
 			case <-ctx.Done():
 				return fileResult{ID: row.ID, Status: "failed",
 					Error: ctx.Err().Error(), Attempts: attempts}
@@ -291,7 +293,12 @@ func flusherLoop(ctx context.Context, pool *pgxpool.Pool, results <-chan fileRes
 		}
 		buf = buf[:0]
 		if timer != nil {
-			timer.Stop()
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			timer = nil
 			timerC = nil
 		}
