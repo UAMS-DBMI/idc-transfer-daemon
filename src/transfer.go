@@ -87,7 +87,7 @@ func processTransfer(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Clien
 		if _, err := pool.Exec(ctx, `
             UPDATE dataset_release_transfer
                SET transfer_status='failed', when_updated=now(),
-                   who_updated='idc_transfer_daemon'
+                   who_updated=0 -- auth.users 0 = 'system'
              WHERE dataset_release_transfer_id=$1
         `, transferID); err != nil {
 			return fmt.Errorf("mark failed: %w", err)
@@ -114,7 +114,7 @@ func processTransfer(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Clien
 	if _, err := tx.Exec(ctx, `
         UPDATE dataset_release_transfer
            SET transfer_status='success', when_updated=now(),
-               who_updated='idc_transfer_daemon'
+               who_updated=0 -- auth.users 0 = 'system'
          WHERE dataset_release_transfer_id=$1
     `, transferID); err != nil {
 		return fmt.Errorf("mark success: %w", err)
@@ -137,7 +137,7 @@ func claimTransfer(ctx context.Context, pool *pgxpool.Pool, transferID int64) (b
 	err = tx.QueryRow(ctx, `
         UPDATE dataset_release_transfer
            SET transfer_status = 'in_progress', when_updated = now(),
-               who_updated = 'idc_transfer_daemon'
+               who_updated = 0 -- auth.users 0 = 'system'
          WHERE dataset_release_transfer_id = $1
            AND transfer_status IN ('queued', 'in_progress')
         RETURNING dataset_release_transfer_id
