@@ -16,9 +16,11 @@ import (
 )
 
 type fileRow struct {
-	ID        int64 // transfer_file_id
-	FileID    int64
-	GCSURL    string
+	ID     int64 // transfer_file_id
+	FileID int64
+	// transfer_file.file_dest_url -- relative to transfer_idc.base_gcs_url
+	// (e.g. "imaging/<md5>"), not a gs:// URL.
+	DestPath  string
 	LocalPath string
 	MD5Hex    string
 	Attempts  int32
@@ -42,6 +44,17 @@ func processTransfer(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Clien
 	}
 	log.Info("transfer starting", "transfer_id", transferID)
 
+	// Every path in transfer_file is relative to this anchor, so read it once
+	// per transfer rather than per row. Posda's queue gate rejects an empty
+	// base_gcs_url, but the field stays editable in the Manage modal, so the
+	// daemon cannot assume it is set: without it every object would land in a
+	// bucket-less path.
+	baseURL, err := loadBaseGCSURL(ctx, pool, transferID)
+	if err != nil {
+		return err
+	}
+	log.Info("resolved package anchor", "transfer_id", transferID, "base_gcs_url", baseURL)
+
 	queue := make(chan fileRow, Concurrency*2)
 	results := make(chan fileResult, FlushEvery*4)
 
@@ -56,7 +69,7 @@ func processTransfer(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Clien
 		cg, cgctx := errgroup.WithContext(gctx)
 		for i := 0; i < Concurrency; i++ {
 			cg.Go(func() error {
-				return fileConsumer(cgctx, gcs, transferID, queue, results, log)
+				return fileConsumer(cgctx, gcs, transferID, baseURL, queue, results, log)
 			})
 		}
 		err := cg.Wait()
@@ -96,9 +109,9 @@ func processTransfer(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Clien
 		return nil
 	}
 
-	manifestURL, err := uploadManifest(ctx, pool, gcs, transferID)
+	manifestURLs, err := uploadManifests(ctx, pool, gcs, transferID, baseURL)
 	if err != nil {
-		return fmt.Errorf("upload manifest: %w", err)
+		return fmt.Errorf("upload manifests: %w", err)
 	}
 
 	// The manifest URL is deliberately not recorded. Manifest names are fixed
@@ -114,7 +127,7 @@ func processTransfer(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Clien
     `, transferID); err != nil {
 		return fmt.Errorf("mark success: %w", err)
 	}
-	log.Info("transfer succeeded", "transfer_id", transferID, "manifest", manifestURL)
+	log.Info("transfer succeeded", "transfer_id", transferID, "manifests", manifestURLs)
 	return nil
 }
 
@@ -181,7 +194,7 @@ func fileProducer(ctx context.Context, pool *pgxpool.Pool, transferID int64, que
 		var batch []fileRow
 		for rows.Next() {
 			var r fileRow
-			if err := rows.Scan(&r.ID, &r.FileID, &r.GCSURL, &r.LocalPath, &r.MD5Hex, &r.Attempts); err != nil {
+			if err := rows.Scan(&r.ID, &r.FileID, &r.DestPath, &r.LocalPath, &r.MD5Hex, &r.Attempts); err != nil {
 				rows.Close()
 				return err
 			}
@@ -206,7 +219,7 @@ func fileProducer(ctx context.Context, pool *pgxpool.Pool, transferID int64, que
 	}
 }
 
-func fileConsumer(ctx context.Context, gcs *storage.Client, transferID int64, queue <-chan fileRow, results chan<- fileResult, log *slog.Logger) error {
+func fileConsumer(ctx context.Context, gcs *storage.Client, transferID int64, baseURL string, queue <-chan fileRow, results chan<- fileResult, log *slog.Logger) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -215,7 +228,7 @@ func fileConsumer(ctx context.Context, gcs *storage.Client, transferID int64, qu
 			if !ok {
 				return nil
 			}
-			res := uploadOne(ctx, gcs, transferID, row, log)
+			res := uploadOne(ctx, gcs, transferID, baseURL, row, log)
 			select {
 			case results <- res:
 			case <-ctx.Done():
@@ -228,13 +241,16 @@ func fileConsumer(ctx context.Context, gcs *storage.Client, transferID int64, qu
 // uploadOne drives one file all the way to a terminal result. The producer
 // streams each row exactly once, so there is no second pass to clean up
 // anything left at 'pending' — inline retry is load-bearing.
-func uploadOne(ctx context.Context, gcs *storage.Client, transferID int64, row fileRow, log *slog.Logger) fileResult {
+func uploadOne(ctx context.Context, gcs *storage.Client, transferID int64, baseURL string, row fileRow, log *slog.Logger) fileResult {
 	expectedMD5, err := decodeMD5Hex(row.MD5Hex)
 	if err != nil {
 		return fileResult{ID: row.ID, Status: "failed",
 			Error: fmt.Sprintf("decode md5 digest: %v", err), Attempts: row.Attempts + 1}
 	}
-	bucket, object, err := parseGSURL(row.GCSURL)
+	// DestPath is relative, so the anchor supplies the bucket and the package
+	// folder. parseGSURL splits at the first slash after gs://, so the rest --
+	// "<slug>/v<n>/imaging/<md5>" -- is the object name, slashes included.
+	bucket, object, err := parseGSURL(baseURL + "/" + row.DestPath)
 	if err != nil {
 		return fileResult{ID: row.ID, Status: "failed", Error: err.Error(), Attempts: row.Attempts + 1}
 	}
@@ -351,47 +367,109 @@ func flushBatch(ctx context.Context, pool *pgxpool.Pool, buf []fileResult) error
 	return err
 }
 
-func uploadManifest(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Client, transferID int64) (string, error) {
-	var manifestPath string
+// datasetManifest is required for every IDC transfer -- it identifies the
+// submission -- so its absence is a setup failure rather than an empty case.
+const datasetManifest = "dataset_manifest.csv"
+
+// loadBaseGCSURL reads the package anchor that every relative path hangs off.
+// Posda owns this value; the daemon only ever reads it.
+func loadBaseGCSURL(ctx context.Context, pool *pgxpool.Pool, transferID int64) (string, error) {
+	var base *string
 	err := pool.QueryRow(ctx, `
-        SELECT fsr.root_path || '/' || fl.rel_path
-          FROM transfer_idc       ti
-          JOIN file_location      fl  ON fl.file_id = ti.dataset_manifest_file_id
+        SELECT base_gcs_url FROM transfer_idc
+         WHERE dataset_release_transfer_id = $1
+    `, transferID).Scan(&base)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("transfer=%d: no transfer_idc row", transferID)
+	}
+	if err != nil {
+		return "", err
+	}
+	if base == nil || strings.TrimSpace(*base) == "" {
+		return "", fmt.Errorf("transfer=%d: transfer_idc.base_gcs_url is empty", transferID)
+	}
+	// Curator-editable free text in the Manage modal, so tolerate a trailing
+	// slash instead of producing ".../v1//imaging/<md5>".
+	anchor := strings.TrimRight(strings.TrimSpace(*base), "/")
+	if !strings.HasPrefix(anchor, "gs://") {
+		return "", fmt.Errorf("transfer=%d: base_gcs_url %q is not a gs:// URL", transferID, anchor)
+	}
+	return anchor, nil
+}
+
+// uploadManifests uploads whichever of IDC's three manifests this transfer
+// carries, to fixed names at the package root. Which ones exist varies: Posda
+// derives what is required from the transfer's content -- imaging when it
+// carries DICOM, clinical when it carries Clinical Data files -- so absence is
+// meaningful and not an error, except for the dataset manifest.
+//
+// Destinations come from the anchor directly. The previous version recovered
+// the folder by stripping after the last slash of a sample file URL, which
+// worked only while every object sat flat at <base>/<md5>; with files now under
+// imaging/ and clinical/ it would have computed <base>/imaging and written the
+// manifests one level too deep.
+func uploadManifests(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Client, transferID int64, baseURL string) ([]string, error) {
+	rows, err := pool.Query(ctx, `
+        SELECT DISTINCT ON (m.object_name)
+               m.object_name,
+               fsr.root_path || '/' || fl.rel_path
+          FROM transfer_idc ti
+          CROSS JOIN LATERAL (VALUES
+                ('dataset_manifest.csv',  ti.dataset_manifest_file_id),
+                ('imaging_manifest.csv',  ti.imaging_manifest_file_id),
+                ('clinical_manifest.csv', ti.clinical_manifest_file_id)
+             ) AS m(object_name, file_id)
+          -- inner joins drop the manifests this transfer does not carry
+          JOIN file_location      fl  ON fl.file_id = m.file_id
           JOIN file_storage_root  fsr ON fsr.file_storage_root_id = fl.file_storage_root_id
          WHERE ti.dataset_release_transfer_id = $1
-    `, transferID).Scan(&manifestPath)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", fmt.Errorf("transfer=%d: transfer_idc.dataset_manifest_file_id missing "+
-			"or its file has no location — external setup did not run", transferID)
-	}
+         -- file_location has no unique constraint and does carry exact
+         -- duplicate rows, so take one path per manifest. Any is equivalent:
+         -- every duplicate observed resolves to the same root and rel_path.
+         ORDER BY m.object_name
+    `, transferID)
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+	defer rows.Close()
+
+	type manifest struct{ object, localPath string }
+	var found []manifest
+	haveDataset := false
+	for rows.Next() {
+		var m manifest
+		if err := rows.Scan(&m.object, &m.localPath); err != nil {
+			return nil, err
+		}
+		if m.object == datasetManifest {
+			haveDataset = true
+		}
+		found = append(found, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if !haveDataset {
+		return nil, fmt.Errorf("transfer=%d: transfer_idc.%s missing "+
+			"or its file has no location — external setup did not run",
+			transferID, "dataset_manifest_file_id")
 	}
 
-	var sample string
-	if err := pool.QueryRow(ctx, `
-        SELECT file_dest_url FROM transfer_file
-         WHERE dataset_release_transfer_id = $1
-         LIMIT 1
-    `, transferID).Scan(&sample); err != nil {
-		return "", fmt.Errorf("recover base_path: %w", err)
+	uploaded := make([]string, 0, len(found))
+	for _, m := range found {
+		url := baseURL + "/" + m.object
+		bucket, object, err := parseGSURL(url)
+		if err != nil {
+			return nil, err
+		}
+		digest, err := md5OfFile(m.localPath)
+		if err != nil {
+			return nil, fmt.Errorf("compute md5 for %s: %w", m.object, err)
+		}
+		if err := uploadFile(ctx, gcs, bucket, object, m.localPath, digest); err != nil {
+			return nil, fmt.Errorf("upload %s: %w", m.object, err)
+		}
+		uploaded = append(uploaded, url)
 	}
-	slash := strings.LastIndexByte(sample, '/')
-	if slash < 0 {
-		return "", fmt.Errorf("malformed sample file_dest_url %q", sample)
-	}
-	manifestURL := sample[:slash] + "/manifest.csv"
-
-	bucket, object, err := parseGSURL(manifestURL)
-	if err != nil {
-		return "", err
-	}
-	digest, err := md5OfFile(manifestPath)
-	if err != nil {
-		return "", fmt.Errorf("compute manifest md5: %w", err)
-	}
-	if err := uploadFile(ctx, gcs, bucket, object, manifestPath, digest); err != nil {
-		return "", err
-	}
-	return manifestURL, nil
+	return uploaded, nil
 }
