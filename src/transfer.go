@@ -101,26 +101,18 @@ func processTransfer(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Clien
 		return fmt.Errorf("upload manifest: %w", err)
 	}
 
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin success tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx,
-		"UPDATE transfer_idc SET gcs_url=$1 WHERE dataset_release_transfer_id=$2",
-		manifestURL, transferID); err != nil {
-		return fmt.Errorf("set transfer_idc gcs_url: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `
+	// The manifest URL is deliberately not recorded. Manifest names are fixed
+	// and sit directly under transfer_idc.base_gcs_url, so the URL is derivable.
+	// It must not be written into base_gcs_url: that is the package anchor Posda
+	// owns and every relative file path hangs off, so storing a manifest URL
+	// there would repoint the whole package one level deeper.
+	if _, err := pool.Exec(ctx, `
         UPDATE dataset_release_transfer
            SET transfer_status='success', when_updated=now(),
                who_updated=0 -- auth.users 0 = 'system'
          WHERE dataset_release_transfer_id=$1
     `, transferID); err != nil {
 		return fmt.Errorf("mark success: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit success: %w", err)
 	}
 	log.Info("transfer succeeded", "transfer_id", transferID, "manifest", manifestURL)
 	return nil
