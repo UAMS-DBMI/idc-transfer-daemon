@@ -16,7 +16,7 @@ import (
 )
 
 type fileRow struct {
-	ID        int64 // transfer_idc_file_id
+	ID        int64 // transfer_file_id
 	FileID    int64
 	GCSURL    string
 	LocalPath string
@@ -74,7 +74,7 @@ func processTransfer(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Clien
 	if err := pool.QueryRow(ctx, `
         SELECT COUNT(*) FILTER (WHERE status = 'completed'),
                COUNT(*) FILTER (WHERE status <> 'completed')
-          FROM transfer_idc_file
+          FROM transfer_file
          WHERE dataset_release_transfer_id = $1
     `, transferID).Scan(&ok, &notOk); err != nil {
 		return fmt.Errorf("tally: %w", err)
@@ -149,11 +149,11 @@ func claimTransfer(ctx context.Context, pool *pgxpool.Pool, transferID int64) (b
 		return false, err
 	}
 
-	// Fan-out into transfer_idc_file already happened externally; on re-queue,
+	// Fan-out into transfer_file already happened externally; on re-queue,
 	// give previously failed files another pass.
 	if _, err := tx.Exec(ctx, `
-        UPDATE transfer_idc_file
-           SET status='pending', attempts=0, error=NULL, updated_at=now()
+        UPDATE transfer_file
+           SET status='pending', attempts=0, error=NULL, when_updated=now()
          WHERE dataset_release_transfer_id = $1 AND status = 'failed'
     `, transferID); err != nil {
 		return false, err
@@ -167,20 +167,20 @@ func fileProducer(ctx context.Context, pool *pgxpool.Pool, transferID int64, que
 	var lastID int64
 	for {
 		rows, err := pool.Query(ctx, `
-            SELECT tif.transfer_idc_file_id,
+            SELECT tif.transfer_file_id,
                    tif.file_id,
-                   tif.gcs_url,
+                   tif.file_dest_url,
                    fsr.root_path || '/' || fl.rel_path,
                    f.digest,
                    tif.attempts
-              FROM transfer_idc_file  tif
+              FROM transfer_file      tif
               JOIN file               f   ON f.file_id  = tif.file_id
               JOIN file_location      fl  ON fl.file_id = tif.file_id
               JOIN file_storage_root  fsr ON fsr.file_storage_root_id = fl.file_storage_root_id
              WHERE tif.dataset_release_transfer_id = $1
                AND tif.status = 'pending'
-               AND tif.transfer_idc_file_id > $2
-             ORDER BY tif.transfer_idc_file_id
+               AND tif.transfer_file_id > $2
+             ORDER BY tif.transfer_file_id
              LIMIT 1000
         `, transferID, lastID)
 		if err != nil {
@@ -334,7 +334,7 @@ func flusherLoop(ctx context.Context, pool *pgxpool.Pool, results <-chan fileRes
 // flushBatch writes a batch of terminal results via UPDATE FROM unnest(...).
 // error is encoded as text[] and NULLed in SQL for completed rows, dodging
 // the pgtype.Array[pgtype.Text] boilerplate for nullable text arrays.
-// gcs_url is owned by the external fan-out and never written here.
+// file_dest_url is owned by the external fan-out and never written here.
 func flushBatch(ctx context.Context, pool *pgxpool.Pool, buf []fileResult) error {
 	ids := make([]int64, len(buf))
 	statuses := make([]string, len(buf))
@@ -347,14 +347,14 @@ func flushBatch(ctx context.Context, pool *pgxpool.Pool, buf []fileResult) error
 		attempts[i] = r.Attempts
 	}
 	_, err := pool.Exec(ctx, `
-        UPDATE transfer_idc_file SET
-            status     = u.status,
-            error      = CASE WHEN u.status = 'completed' THEN NULL ELSE u.error END,
-            attempts   = u.attempts,
-            updated_at = now()
+        UPDATE transfer_file SET
+            status       = u.status,
+            error        = CASE WHEN u.status = 'completed' THEN NULL ELSE u.error END,
+            attempts     = u.attempts,
+            when_updated = now()
           FROM unnest($1::bigint[], $2::text[], $3::text[], $4::int[])
             AS u(id, status, error, attempts)
-         WHERE transfer_idc_file.transfer_idc_file_id = u.id
+         WHERE transfer_file.transfer_file_id = u.id
     `, ids, statuses, errs, attempts)
 	return err
 }
@@ -378,7 +378,7 @@ func uploadManifest(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Client
 
 	var sample string
 	if err := pool.QueryRow(ctx, `
-        SELECT gcs_url FROM transfer_idc_file
+        SELECT file_dest_url FROM transfer_file
          WHERE dataset_release_transfer_id = $1
          LIMIT 1
     `, transferID).Scan(&sample); err != nil {
@@ -386,7 +386,7 @@ func uploadManifest(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Client
 	}
 	slash := strings.LastIndexByte(sample, '/')
 	if slash < 0 {
-		return "", fmt.Errorf("malformed sample gcs_url %q", sample)
+		return "", fmt.Errorf("malformed sample file_dest_url %q", sample)
 	}
 	manifestURL := sample[:slash] + "/manifest.csv"
 
