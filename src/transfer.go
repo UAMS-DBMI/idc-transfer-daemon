@@ -139,14 +139,19 @@ func claimTransfer(ctx context.Context, pool *pgxpool.Pool, transferID int64) (b
 	defer tx.Rollback(ctx)
 
 	var got int64
+	// The destination check is inside the claim, not a separate lookup, so a
+	// wrong-destination transfer is never briefly marked in_progress.
 	err = tx.QueryRow(ctx, `
-        UPDATE dataset_release_transfer
+        UPDATE dataset_release_transfer drt
            SET transfer_status = 'in_progress', when_updated = now(),
                who_updated = 0 -- auth.users 0 = 'system'
-         WHERE dataset_release_transfer_id = $1
-           AND transfer_status IN ('queued', 'in_progress')
-        RETURNING dataset_release_transfer_id
-    `, transferID).Scan(&got)
+          FROM transfer_destination td
+         WHERE td.destination_id = drt.destination_id
+           AND drt.dataset_release_transfer_id = $1
+           AND drt.transfer_status IN ('queued', 'in_progress')
+           AND td.destination_abbr = $2
+        RETURNING drt.dataset_release_transfer_id
+    `, transferID, DestinationAbbr).Scan(&got)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}

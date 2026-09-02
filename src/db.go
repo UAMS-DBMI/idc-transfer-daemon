@@ -10,11 +10,21 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// DestinationAbbr is the only destination this daemon handles. Both entry
+// points -- the NOTIFY trigger and the reconciler below -- see every
+// destination's transfers, because the trigger fires on any queued transfer
+// regardless of where it is bound. Without this filter the daemon claims a
+// WordPress or Aspera transfer, finds no transfer_idc row, and strands it
+// in_progress with no lease to reclaim it.
+const DestinationAbbr = "idc"
+
 const reconcileSQL = `
-SELECT dataset_release_transfer_id
-  FROM dataset_release_transfer
- WHERE transfer_status IN ('queued', 'in_progress')
- ORDER BY dataset_release_transfer_id
+SELECT drt.dataset_release_transfer_id
+  FROM dataset_release_transfer drt
+  JOIN transfer_destination td USING (destination_id)
+ WHERE drt.transfer_status IN ('queued', 'in_progress')
+   AND td.destination_abbr = $1
+ ORDER BY drt.dataset_release_transfer_id
 `
 
 // queryer is satisfied by both *pgxpool.Pool and *pgx.Conn so the same
@@ -24,7 +34,7 @@ type queryer interface {
 }
 
 func enqueueStale(ctx context.Context, q queryer, pending chan<- int64) error {
-	rows, err := q.Query(ctx, reconcileSQL)
+	rows, err := q.Query(ctx, reconcileSQL, DestinationAbbr)
 	if err != nil {
 		return err
 	}
