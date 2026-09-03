@@ -12,3 +12,4 @@ wheels/
 *.dat
 full_schema.sql
 sa-key.json
+.vscode

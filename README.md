@@ -16,32 +16,48 @@ The daemon:
    safety net for missed notifications.
 2. **Claims** a transfer (`'queued' → 'in_progress'`) in a single transaction so
    only one daemon ever owns it.
-3. **Streams** file rows out of `transfer_idc_file` (pre-populated by an external
-   fan-out step) in keyset-paginated batches, joining back to `file_location` to
-   recover each file's local path and MD5.
-4. **Uploads** files in parallel to their pre-computed, content-addressed GCS URLs
-   (`<base_path>/<md5>`). HEAD-then-verify-MD5 makes re-runs idempotent.
+3. **Streams** file rows out of `transfer_file` (populated by Posda in the same
+   transaction as the queue flip) in keyset-paginated batches, joining back to
+   `file_location` to recover each file's local path and MD5.
+4. **Uploads** files in parallel. `transfer_file.file_dest_url` is stored
+   *relative* to the package anchor — `imaging/<md5>` for DICOM,
+   `clinical/<name>` otherwise — and the daemon joins it to
+   `transfer_idc.base_gcs_url`, read once per transfer. HEAD-then-verify-MD5
+   makes re-runs idempotent.
 5. **Records** per-file `completed` / `failed` status with retry/attempt counters,
    flushed in batches.
-6. **Uploads the manifest file** and writes its URL into `transfer_idc.gcs_url`,
-   then marks the transfer `'success'` (or `'failed'` if any file is still
-   unresolved after retries).
+6. **Uploads the manifests** — IDC takes up to three (`dataset_manifest.csv`,
+   `imaging_manifest.csv`, `clinical_manifest.csv`) at fixed names directly
+   under the anchor. Which exist varies per transfer: Posda derives what is
+   required from the content, so the daemon uploads whichever are present. Their
+   URLs are not recorded — the names are fixed, so they are derivable. Then it
+   marks the transfer `'success'` (or `'failed'` if any file is still unresolved
+   after retries).
 
 Concurrency is goroutines + buffered channels — one transfer at a time
 (`TRANSFER_PARALLELISM = 1`), up to 200 upload workers within it. No external
 queue; Postgres is the source of truth.
 
+**The boundary: Posda decides, the daemon transports.** Posda owns what ships,
+which files, manifest generation, the bucket path scheme and every gate.
+`transfer_idc.base_gcs_url` in particular is written by Posda and only ever
+*read* here — it is the package anchor every relative path hangs off, so a
+relocation is a one-field edit on Posda's side. The daemon moves bytes, records
+per-file progress, and reports terminal status.
+
 ## Layout
 
 - `src/` — the Go daemon (`main.go`, `daemon.go`, `db.go`, `gcs.go`,
   `transfer.go`) plus its `Dockerfile` and `Makefile`.
-- `sql/` — schema additions and test fixtures:
-  - `schema_additions.sql` — the `transfer_idc_file` table, the
-    `'in_progress'` status, and the LISTEN/NOTIFY trigger.
-  - `transfer_preparation.sql` — the external fan-out query that materializes
-    `transfer_idc_file` rows before a transfer is queued.
-  - `test_data.sql`, `activate_test.sql` — fixtures for local end-to-end runs.
-- `full_schema.sql` — snapshot of the upstream Posda schema for reference.
+- `full_schema.sql` — snapshot of the upstream Posda schema for reference
+  (gitignored; obtain locally).
+
+There is no `sql/` directory. It held a `transfer_idc_file` table, a duplicate
+copy of the LISTEN/NOTIFY trigger, an external fan-out query and test fixtures —
+all removed once Posda took ownership. Posda's
+`database/migrations/posda_files/0047_add_dataset_module_tables.sql` is the
+source of truth for the schema and the trigger, and Posda fans out
+`transfer_file` rows itself at queue time.
 - `PLAN.md` — full architecture and design rationale; read this before changing
   the daemon's claim/recovery, batching, or status semantics.
 
