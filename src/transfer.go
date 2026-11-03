@@ -55,6 +55,35 @@ func processTransfer(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Clien
 	}
 	log.Info("resolved package anchor", "transfer_id", transferID, "base_gcs_url", baseURL)
 
+	// Hold the version's lock for the whole upload, with the folder at Draft so
+	// IDC ignores it. It stays at Draft afterward: setting it Ready is the
+	// curator's decision, made in Posda. A busy lock leaves the transfer
+	// in_progress, and the reconciler tries again on its next sweep.
+	folder, err := openVersionFolder(gcs, baseURL)
+	if err != nil {
+		return err
+	}
+	workerID := fmt.Sprintf("posda-transfer-%d", transferID)
+	if err := beginVersionWrite(ctx, folder, workerID, lockBackoff); err != nil {
+		switch {
+		case errors.Is(err, errLockBusy):
+			log.Info("version folder is locked; will retry", "transfer_id", transferID, "base_gcs_url", baseURL)
+			return nil
+		case errors.Is(err, errVersionClosed):
+			log.Warn("transfer refused", "transfer_id", transferID, "base_gcs_url", baseURL, "err", err)
+			return markTransferFailed(ctx, pool, transferID)
+		}
+		return fmt.Errorf("begin version write: %w", err)
+	}
+	defer func() {
+		// Not ctx: shutdown must not leave the lock behind.
+		releaseCtx, cancel := context.WithTimeout(context.Background(), lockReleaseTimeout)
+		defer cancel()
+		if err := releaseLock(releaseCtx, folder, workerID); err != nil {
+			log.Error("could not release version lock", "transfer_id", transferID, "err", err)
+		}
+	}()
+
 	queue := make(chan fileRow, Concurrency*2)
 	results := make(chan fileResult, FlushEvery*4)
 
@@ -97,13 +126,8 @@ func processTransfer(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Clien
 	if notOk > 0 || ok == 0 {
 		// Any non-completed row blocks submission; ok==0 catches the empty case
 		// (external fan-out didn't run, or recordset was empty).
-		if _, err := pool.Exec(ctx, `
-            UPDATE dataset_release_transfer
-               SET transfer_status='failed', when_updated=now(),
-                   who_updated=0 -- auth.users 0 = 'system'
-             WHERE dataset_release_transfer_id=$1
-        `, transferID); err != nil {
-			return fmt.Errorf("mark failed: %w", err)
+		if err := markTransferFailed(ctx, pool, transferID); err != nil {
+			return err
 		}
 		log.Warn("transfer marked failed", "transfer_id", transferID)
 		return nil
@@ -128,6 +152,18 @@ func processTransfer(ctx context.Context, pool *pgxpool.Pool, gcs *storage.Clien
 		return fmt.Errorf("mark success: %w", err)
 	}
 	log.Info("transfer succeeded", "transfer_id", transferID, "manifests", manifestURLs)
+	return nil
+}
+
+func markTransferFailed(ctx context.Context, pool *pgxpool.Pool, transferID int64) error {
+	if _, err := pool.Exec(ctx, `
+        UPDATE dataset_release_transfer
+           SET transfer_status='failed', when_updated=now(),
+               who_updated=0 -- auth.users 0 = 'system'
+         WHERE dataset_release_transfer_id=$1
+    `, transferID); err != nil {
+		return fmt.Errorf("mark failed: %w", err)
+	}
 	return nil
 }
 
