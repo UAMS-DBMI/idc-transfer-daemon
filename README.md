@@ -33,6 +33,12 @@ The daemon:
    URLs are not recorded — the names are fixed, so they are derivable. Then it
    marks the transfer `'success'` (or `'failed'` if any file is still unresolved
    after retries).
+7. **Coordinates with IDC** through `status.lock` and `status.json` in the version
+   folder: it holds the lock for the whole upload and leaves the status at
+   `Draft`. A curator sets `Ready for processing` from Posda, which takes the
+   same lock. A version IDC has processed is refused. The object names and JSON
+   shape aren't yet agreed with IDC. Tests for this need a GCS emulator; see
+   `src/versionlock_test.go`.
 
 Concurrency is goroutines + buffered channels — one transfer at a time
 (`TRANSFER_PARALLELISM = 1`), up to 200 upload workers within it. No external

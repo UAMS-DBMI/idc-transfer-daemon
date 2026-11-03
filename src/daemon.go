@@ -22,6 +22,8 @@ const (
 	TransferParallelism = 1               // at most one transfer in flight
 	ReconcileInterval   = 5 * time.Minute // safety-net rescan for missed NOTIFYs
 	NotifyChannel       = "idc_transfer_channel"
+	lockBackoff         = 500 * time.Millisecond // doubles per retry: about 15s in all
+	lockReleaseTimeout  = 30 * time.Second
 )
 
 func run(ctx context.Context, log *slog.Logger) error {
