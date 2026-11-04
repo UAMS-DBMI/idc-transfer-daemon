@@ -90,6 +90,7 @@ Environment variables:
 
 ```sh
 cd src
-make build   # builds tcia/transfer-daemon:go
+make build   # builds registry.dbmi.cloud/idc-transfer-daemon:<VERSION> (see src/Makefile)
 make run     # runs against a local oneposda Docker network
+make push    # pushes the built image to registry.dbmi.cloud
 ```

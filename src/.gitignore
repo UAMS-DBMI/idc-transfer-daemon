@@ -1,2 +1,3 @@
 # don't commit a compiled binary
 idc-transfer-daemon
+.last_built

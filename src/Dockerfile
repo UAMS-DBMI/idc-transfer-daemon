@@ -2,7 +2,11 @@
 
 # ---- build stage ----------------------------------------------------------
 # Pinned to the toolchain declared in go.mod. Bump together.
-FROM golang:1.26.2-bookworm AS build
+# --platform=$BUILDPLATFORM runs the compiler natively on the build host and
+# cross-compiles for the target (set via `docker buildx --platform`), rather
+# than emulating the target CPU for the whole build.
+FROM --platform=$BUILDPLATFORM golang:1.26.2-bookworm AS build
+ARG TARGETOS TARGETARCH
 
 WORKDIR /src
 
@@ -17,7 +21,7 @@ COPY . .
 # -trimpath strips host paths from the binary; -ldflags shrinks it a bit.
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w" \
         -o /out/idc-transfer-daemon .
 
