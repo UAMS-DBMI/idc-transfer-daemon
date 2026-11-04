@@ -53,9 +53,9 @@ func enqueueStale(ctx context.Context, q queryer, pending chan<- int64) error {
 	return rows.Err()
 }
 
-func runListener(ctx context.Context, dsn string, pending chan<- int64, log *slog.Logger) {
+func runListener(ctx context.Context, connCfg *pgx.ConnConfig, pending chan<- int64, log *slog.Logger) {
 	for ctx.Err() == nil {
-		err := listenOnce(ctx, dsn, pending, log)
+		err := listenOnce(ctx, connCfg, pending, log)
 		if err != nil && ctx.Err() == nil {
 			log.Warn("listener connection lost; retrying in 5s", "err", err)
 			select {
@@ -67,8 +67,8 @@ func runListener(ctx context.Context, dsn string, pending chan<- int64, log *slo
 	}
 }
 
-func listenOnce(ctx context.Context, dsn string, pending chan<- int64, log *slog.Logger) error {
-	conn, err := pgx.Connect(ctx, dsn)
+func listenOnce(ctx context.Context, connCfg *pgx.ConnConfig, pending chan<- int64, log *slog.Logger) error {
+	conn, err := pgx.ConnectConfig(ctx, connCfg)
 	if err != nil {
 		return err
 	}

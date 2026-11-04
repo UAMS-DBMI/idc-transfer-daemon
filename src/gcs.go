@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,8 +24,11 @@ func newGCSClient(ctx context.Context) (*storage.Client, error) {
 	// we build ours, so we have to set it ourselves or the token comes back
 	// with no scope and Google rejects it.
 	opts := []option.ClientOption{option.WithScopes(storage.ScopeFullControl)}
-	if kf := os.Getenv("GCS_KEY_FILE"); kf != "" {
-		opts = append(opts, option.WithCredentialsFile(kf))
+	// The key is passed by value in GCS_KEY_JSON rather than by path, so the
+	// container needs no secret volume. A malformed value fails NewTransport
+	// below rather than being ignored.
+	if kj := os.Getenv("GCS_KEY_JSON"); kj != "" {
+		opts = append(opts, option.WithCredentialsJSON([]byte(kj)))
 	} else if _, err := os.Stat("sa-key.json"); err == nil {
 		opts = append(opts, option.WithCredentialsFile("sa-key.json"))
 	}
@@ -41,6 +45,23 @@ func newGCSClient(ctx context.Context) (*storage.Client, error) {
 		return nil, fmt.Errorf("build gcs transport: %w", err)
 	}
 	return storage.NewClient(ctx, option.WithHTTPClient(&http.Client{Transport: rt}))
+}
+
+// serviceAccountEmail pulls client_email out of a service-account key so the
+// startup log can name the uploading identity without echoing the key itself.
+// Returns "" when keyJSON is empty or unparseable; newGCSClient reports the
+// latter as a hard error, so nothing is lost by staying quiet here.
+func serviceAccountEmail(keyJSON string) string {
+	if keyJSON == "" {
+		return ""
+	}
+	var key struct {
+		ClientEmail string `json:"client_email"`
+	}
+	if err := json.Unmarshal([]byte(keyJSON), &key); err != nil {
+		return ""
+	}
+	return key.ClientEmail
 }
 
 func parseGSURL(url string) (bucket, name string, err error) {

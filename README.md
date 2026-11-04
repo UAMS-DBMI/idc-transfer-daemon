@@ -71,9 +71,14 @@ source of truth for the schema and the trigger, and Posda fans out
 
 Environment variables:
 
-- `TRANSFER_DAEMON_DSN` — Postgres DSN for the Posda database (required).
-- `GCS_KEY_FILE` — path to a GCS service-account key file (required at runtime;
-  see `src/Makefile` for the Docker invocation used during development).
+- `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` — the standard libpq
+  variables, with libpq's defaults and precedence (so `PGSSLMODE`, `PGPASSFILE`,
+  `PGSERVICE` etc. work too). Point them at the Posda `posda_files` database.
+  Anything that works for `psql` works here.
+- `GCS_KEY_JSON` — the full contents of a GCS service-account key (the JSON
+  itself, not a path). Required at runtime; see `src/Makefile` for the Docker
+  invocation used during development. If unset, a `sa-key.json` in the working
+  directory is used, and failing that Application Default Credentials.
 - `GELF_ADDR` — optional `host:port` for a GELF UDP log target (e.g.
   `graylog:12201`). When set, logs fan out to stderr *and* GELF; when unset,
   stderr only. A dial failure at startup falls back to stderr-only.

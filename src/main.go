@@ -10,8 +10,7 @@ import (
 )
 
 func main() {
-	dsn := os.Getenv("TRANSFER_DAEMON_DSN")
-	gcsKeyFile := os.Getenv("GCS_KEY_FILE")
+	gcsKeyJSON := os.Getenv("GCS_KEY_JSON")
 	gelfAddr := os.Getenv("GELF_ADDR")
 	rawGelfTag := os.Getenv("GELF_TAG")
 	gelfTag := rawGelfTag
@@ -23,11 +22,12 @@ func main() {
 	defer closeLogger()
 	slog.SetDefault(logger)
 
-	if dsn == "" {
-		warnMisspelledEnv(logger, "TRANSFER_DAEMON_DSN", "TRANSFER_DAEMON")
+	if os.Getenv("TRANSFER_DAEMON_DSN") != "" {
+		logger.Warn("TRANSFER_DAEMON_DSN is no longer read; configure Postgres with " +
+			"PGHOST, PGPORT, PGUSER, PGPASSWORD and PGDATABASE instead")
 	}
-	if gcsKeyFile == "" {
-		warnMisspelledEnv(logger, "GCS_KEY_FILE", "GCS_KEY")
+	if gcsKeyJSON == "" {
+		warnMisspelledEnv(logger, "GCS_KEY_JSON", "GCS_KEY")
 	}
 	if gelfAddr == "" {
 		warnMisspelledEnv(logger, "GELF_ADDR", "GELF", "GELF_TAG")
@@ -37,8 +37,8 @@ func main() {
 	}
 
 	logger.Info("daemon starting",
-		"transfer_daemon_dsn", redactDSN(dsn),
-		"gcs_key_file", gcsKeyFile,
+		"gcs_key_json_set", gcsKeyJSON != "",
+		"gcs_service_account", serviceAccountEmail(gcsKeyJSON),
 		"gelf_addr", gelfAddr,
 		"gelf_tag", gelfTag,
 		"gelf_active", gelfActive,

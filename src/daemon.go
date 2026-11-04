@@ -2,9 +2,8 @@ package main
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"log/slog"
-	"os"
 	"sync"
 	"time"
 
@@ -26,18 +25,32 @@ const (
 	lockReleaseTimeout  = 30 * time.Second
 )
 
-func run(ctx context.Context, log *slog.Logger) error {
-	dsn := os.Getenv("TRANSFER_DAEMON_DSN")
-	if dsn == "" {
-		return errors.New("TRANSFER_DAEMON_DSN must be set")
-	}
-
-	cfg, err := pgxpool.ParseConfig(dsn)
+// loadPoolConfig builds the pool config from the standard libpq environment
+// (PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE, PGSSLMODE, PGPASSFILE,
+// PGSERVICE, ...). pgx applies the same defaults and precedence as libpq when
+// handed an empty connection string, so the daemon carries no DSN of its own
+// and anything that works for psql works here.
+func loadPoolConfig() (*pgxpool.Config, error) {
+	cfg, err := pgxpool.ParseConfig("")
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("postgres config from PG* environment: %w", err)
 	}
 	cfg.MinConns = PoolMin
 	cfg.MaxConns = PoolMax
+	return cfg, nil
+}
+
+func run(ctx context.Context, log *slog.Logger) error {
+	cfg, err := loadPoolConfig()
+	if err != nil {
+		return err
+	}
+	log.Info("postgres target",
+		"host", cfg.ConnConfig.Host,
+		"port", cfg.ConnConfig.Port,
+		"database", cfg.ConnConfig.Database,
+		"user", cfg.ConnConfig.User,
+	)
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -56,7 +69,10 @@ func run(ctx context.Context, log *slog.Logger) error {
 
 	var infra sync.WaitGroup
 	infra.Add(2)
-	go func() { defer infra.Done(); runListener(ctx, dsn, pending, log) }()
+	// The LISTEN connection lives outside the pool; give it its own copy of the
+	// connection config so neither side can mutate the other's.
+	listenCfg := cfg.ConnConfig.Copy()
+	go func() { defer infra.Done(); runListener(ctx, listenCfg, pending, log) }()
 	go func() { defer infra.Done(); runReconciler(ctx, pool, pending, log) }()
 
 	var inflight sync.Map

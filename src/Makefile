@@ -4,6 +4,7 @@ PGUSER := postgres
 PGPASSWORD := example
 PGHOST := oneposda-db-1
 PGPORT := 5432
+PGDATABASE := posda_files
 GELF_ADDR=tcia-graylog-1.ad.uams.edu:12201
 
 
@@ -11,11 +12,14 @@ default: build
 
 run: .last_built
 	docker run --rm --network oneposda_default \
-	-e TRANSFER_DAEMON_DSN='postgresql://${PGUSER}:${PGPASSWORD}@${PGHOST}:${PGPORT}/posda_files' \
-	-e GCS_KEY_FILE=/secrets/sa-key.json \
+	-e PGHOST=${PGHOST} \
+	-e PGPORT=${PGPORT} \
+	-e PGUSER=${PGUSER} \
+	-e PGPASSWORD=${PGPASSWORD} \
+	-e PGDATABASE=${PGDATABASE} \
+	-e GCS_KEY_JSON="$$(cat sa-key.json)" \
 	-e GELF_ADDR=${GELF_ADDR} \
 	-e GELF_TAG=test-tag \
-	-v ${PWD}/sa-key.json:/secrets/sa-key.json:ro \
 	--mount type=volume,source=oneposda_posda_cache_alpine,target=/home/posda/cache \
 	tcia/transfer-daemon:go
 

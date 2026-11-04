@@ -324,12 +324,9 @@ const (
 )
 
 func run(ctx context.Context, log *slog.Logger) error {
-    dsn := os.Getenv("TRANSFER_DAEMON_DSN")
-    if dsn == "" {
-        return errors.New("TRANSFER_DAEMON_DSN must be set")
-    }
-
-    cfg, err := pgxpool.ParseConfig(dsn)
+    // Empty connection string: pgx reads PGHOST/PGPORT/PGUSER/PGPASSWORD/
+    // PGDATABASE etc. with libpq's defaults and precedence.
+    cfg, err := pgxpool.ParseConfig("")
     if err != nil {
         return err
     }
@@ -531,8 +528,8 @@ import (
 
 func newGCSClient(ctx context.Context) (*storage.Client, error) {
     var opts []option.ClientOption
-    if kf := os.Getenv("GCS_KEY_FILE"); kf != "" {
-        opts = append(opts, option.WithCredentialsFile(kf))
+    if kj := os.Getenv("GCS_KEY_JSON"); kj != "" {
+        opts = append(opts, option.WithCredentialsJSON([]byte(kj)))
     } else if _, err := os.Stat("sa-key.json"); err == nil {
         opts = append(opts, option.WithCredentialsFile("sa-key.json"))
     } // else: fall back to ADC (GOOGLE_APPLICATION_CREDENTIALS / metadata)
@@ -1042,8 +1039,10 @@ After=network.target postgresql.service
 
 [Service]
 ExecStart=/usr/local/bin/idc-transfer-daemon
-Environment=TRANSFER_DAEMON_DSN=postgres://...
-Environment=GCS_KEY_FILE=/etc/idc-transfer/sa-key.json
+Environment=PGHOST=db.example.org PGPORT=5432 PGDATABASE=posda_files
+Environment=PGUSER=posda PGPASSWORD=...
+# The key contents, not a path. Prefer EnvironmentFile= for the secrets.
+Environment=GCS_KEY_JSON={"type":"service_account",...}
 Restart=always
 RestartSec=5
 

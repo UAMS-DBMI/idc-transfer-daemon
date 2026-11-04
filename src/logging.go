@@ -5,9 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net"
-	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 )
@@ -41,25 +39,6 @@ func newLogger(gelfAddr, gelfTag string) (*slog.Logger, bool, func()) {
 	}}
 	return slog.New(&fanoutHandler{handlers: []slog.Handler{stderr, gelf}}), true, func() { conn.Close() }
 }
-
-// redactDSN returns a copy of dsn with the password masked. Handles both the
-// URI form (postgres://user:pass@host/db) and libpq keyword=value form. Used
-// to keep credentials out of the startup config log, which fans out to GELF.
-func redactDSN(dsn string) string {
-	if dsn == "" {
-		return ""
-	}
-	if u, err := url.Parse(dsn); err == nil && u.Scheme != "" && u.User != nil {
-		if _, hasPass := u.User.Password(); hasPass {
-			u.User = url.UserPassword(u.User.Username(), "***")
-			return u.String()
-		}
-		return dsn
-	}
-	return dsnPasswordKV.ReplaceAllString(dsn, "password=***")
-}
-
-var dsnPasswordKV = regexp.MustCompile(`(?i)password\s*=\s*(?:'[^']*'|\S+)`)
 
 // warnMisspelledEnv looks for environment variables whose name contains
 // `token` but isn't `expected` or any of `siblings`, and logs each as a
