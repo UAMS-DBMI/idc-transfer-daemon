@@ -76,6 +76,35 @@ func parseGSURL(url string) (bucket, name string, err error) {
 	return rest[:i], rest[i+1:], nil
 }
 
+const (
+	// chunkGranularity is the unit GCS resumable uploads work in; the client
+	// rounds ChunkSize up to a multiple of it anyway.
+	chunkGranularity = 256 * 1024
+	// maxChunkSize bounds the per-writer buffer. With Concurrency writers in
+	// flight this is also the worst-case upload memory: 200 x 4MiB = 800MiB.
+	maxChunkSize = 4 * 1024 * 1024
+)
+
+// uploadChunkSize picks storage.Writer.ChunkSize for a file of the given size.
+//
+// Every Writer allocates a ChunkSize buffer up front regardless of the object
+// size, and the library default is 16MiB. With 200 concurrent workers that is
+// 3.2GiB of mostly empty buffers before a byte is sent, which OOM-killed the
+// pod under a 2Gi limit. Sizing the buffer to the file (rounded up to the
+// 256KiB granularity) lets the typical sub-megabyte DICOM file go out in one
+// request with a right-sized buffer; the cap turns the rare large file into
+// a resumable upload in maxChunkSize pieces rather than one huge buffer.
+func uploadChunkSize(fileSize int64) int {
+	if fileSize <= 0 {
+		return chunkGranularity
+	}
+	if fileSize >= maxChunkSize {
+		return maxChunkSize
+	}
+	rounded := (fileSize + chunkGranularity - 1) / chunkGranularity * chunkGranularity
+	return int(rounded)
+}
+
 // uploadFile uploads localPath to gs://bucket/object, verifying GCS-side
 // against expectedMD5 (raw 16-byte digest). Returns nil if a matching object
 // already exists. The caller is responsible for retries.
@@ -95,8 +124,13 @@ func uploadFile(ctx context.Context, gcs *storage.Client, bucket, object, localP
 		return fmt.Errorf("open local: %w", err)
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat local: %w", err)
+	}
 
 	w := obj.NewWriter(ctx)
+	w.ChunkSize = uploadChunkSize(info.Size())
 	w.MD5 = expectedMD5 // GCS rejects the upload server-side on mismatch.
 	if _, err := io.Copy(w, f); err != nil {
 		_ = w.Close()
